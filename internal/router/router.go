@@ -26,6 +26,7 @@ func SetupRouter() *gin.Engine {
 	logH := handler.NewLogHandler()
 	menuH := handler.NewMenuHandler()
 	wfH := handler.NewWorkflowHandler()
+	repoCaseH := handler.NewRepoCaseHandler()
 
 	// Helper to register routes on both root and /api prefixes
 	register := func(rg *gin.RouterGroup) {
@@ -52,7 +53,13 @@ func SetupRouter() *gin.Engine {
 		rg.PUT("/projects/:id", projH.UpdateProject)
 		rg.DELETE("/projects/:id", projH.DeleteProject)
 		rg.GET("/project/version/options/:projectId", func(c *gin.Context) { response.Success(c, []interface{}{}) })
-		rg.GET("/case/repository/list", func(c *gin.Context) { response.Success(c, []interface{}{}) })
+
+		// Case Repository (Test as Code Explorer)
+		rg.GET("/case/repository/list", repoCaseH.ListRepositories)
+		rg.GET("/case/repository/:id/tree", repoCaseH.GetRepoTree)
+		rg.GET("/case/repository/:id/cases", repoCaseH.QueryCases)
+		rg.GET("/case/repository/:id/case-detail", repoCaseH.GetCaseDetail)
+		rg.POST("/case/repository/:id/sync", repoCaseH.SyncRepository)
 
 		// Environment
 		rg.POST("/project/environment/list", projH.GetEnvironmentList)

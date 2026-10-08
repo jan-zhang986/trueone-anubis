@@ -124,7 +124,6 @@ func TestStubEndpoints_ReturnEnvelopeWithEmptyArray(t *testing.T) {
 		path   string
 		body   string
 	}{
-		{"case repository list", http.MethodGet, "/case/repository/list", ""},
 		{"project version options", http.MethodGet, "/project/version/options/p-1", ""},
 		{"organization template list", http.MethodGet, "/organization/template/list/100001/case", ""},
 		{"status flow setting", http.MethodGet, "/organization/status/flow/setting/get/100001/case", ""},
