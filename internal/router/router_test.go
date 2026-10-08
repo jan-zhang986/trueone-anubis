@@ -281,7 +281,7 @@ func TestRouteInventory_PrefixesAreKnown(t *testing.T) {
 		"/user", "/system", "/organization", "/quality-workspace", "/functional",
 		"/testcase", "/test-plan", "/bug", "/metrics", "/notification", "/cov",
 		"/notice", "/service", "/operation", "/display", "/setting", "/projects",
-		"/case", "/organization",
+		"/case", "/organization", "/workflow",
 	}
 
 	for _, rt := range r.Routes() {
