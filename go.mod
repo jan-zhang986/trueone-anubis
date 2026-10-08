@@ -5,10 +5,13 @@ go 1.26.1
 require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
+	github.com/vanguard-platform/aegis-sdk-go v1.0.0
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.31.2
 )
+
+replace github.com/vanguard-platform/aegis-sdk-go => ../trueone-sdk/go
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
