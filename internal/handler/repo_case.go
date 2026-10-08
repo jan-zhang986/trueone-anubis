@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -637,3 +638,179 @@ func (h *RepoCaseHandler) SyncRepository(c *gin.Context) {
 	}
 	response.Success(c, true)
 }
+
+// GetRepositoryBranches 实时获取指定仓库的真实 Git 分支与 Tag 列表
+func (h *RepoCaseHandler) GetRepositoryBranches(c *gin.Context) {
+	id := c.Param("id")
+	var repo model.CaseRepository
+	if err := config.DB.Where("id = ?", id).First(&repo).Error; err != nil {
+		response.Fail(c, 404, "用例库不存在")
+		return
+	}
+
+	defaultBranch := repo.DefaultBranch
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+
+	branchSet := make(map[string]bool)
+	var branches []string
+	var tags []string
+
+	// 1. 如果是云端 GitHub 仓库，实时调用 GitHub API 拉取 Branches 和 Tags
+	if strings.Contains(repo.GitURL, "github.com") {
+		owner, repoName := parseGitHubRepoURL(repo.GitURL)
+		if owner != "" && repoName != "" {
+			client := &http.Client{Timeout: 4 * time.Second}
+
+			// 获取 Branches
+			branchReq, err := http.NewRequest("GET", fmt.Sprintf("https://api.github.com/repos/%s/%s/branches", owner, repoName), nil)
+			if err == nil {
+				branchReq.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
+				branchResp, err := client.Do(branchReq)
+				if err == nil && branchResp.StatusCode == http.StatusOK {
+					defer branchResp.Body.Close()
+					var ghBranches []struct {
+						Name string `json:"name"`
+					}
+					if err := json.NewDecoder(branchResp.Body).Decode(&ghBranches); err == nil {
+						for _, b := range ghBranches {
+							if !branchSet[b.Name] {
+								branchSet[b.Name] = true
+								branches = append(branches, b.Name)
+							}
+						}
+					}
+				}
+			}
+
+			// 获取 Tags
+			tagReq, err := http.NewRequest("GET", fmt.Sprintf("https://api.github.com/repos/%s/%s/tags", owner, repoName), nil)
+			if err == nil {
+				tagReq.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
+				tagResp, err := client.Do(tagReq)
+				if err == nil && tagResp.StatusCode == http.StatusOK {
+					defer tagResp.Body.Close()
+					var ghTags []struct {
+						Name string `json:"name"`
+					}
+					if err := json.NewDecoder(tagResp.Body).Decode(&ghTags); err == nil {
+						for _, t := range ghTags {
+							tags = append(tags, t.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. 如果是本地工程路径，通过本地 Git CLI 获取
+	if len(branches) == 0 && repo.LocalPath != "" {
+		out, err := exec.Command("git", "-C", repo.LocalPath, "branch", "--format=%(refname:short)").Output()
+		if err == nil {
+			lines := strings.Split(string(out), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line != "" && !branchSet[line] {
+					branchSet[line] = true
+					branches = append(branches, line)
+				}
+			}
+		}
+
+		tagOut, err := exec.Command("git", "-C", repo.LocalPath, "tag", "--list").Output()
+		if err == nil {
+			tagLines := strings.Split(string(tagOut), "\n")
+			for _, tagLine := range tagLines {
+				tagLine = strings.TrimSpace(tagLine)
+				if tagLine != "" {
+					tags = append(tags, tagLine)
+				}
+			}
+		}
+	}
+
+	// 3. 兜底策略：如果远端和本地都未取到，使用数据库存储或 defaultBranch
+	if len(branches) == 0 {
+		var storedBranches []string
+		_ = json.Unmarshal([]byte(repo.Branches), &storedBranches)
+		for _, b := range storedBranches {
+			if !branchSet[b] {
+				branchSet[b] = true
+				branches = append(branches, b)
+			}
+		}
+		if len(branches) == 0 {
+			branches = []string{defaultBranch}
+		}
+	}
+
+	// 确保 defaultBranch 存在于列表中
+	if !branchSet[defaultBranch] {
+		branches = append([]string{defaultBranch}, branches...)
+	}
+
+	// 异步更新数据库中的 branches 缓存
+	go func() {
+		bBytes, _ := json.Marshal(branches)
+		config.DB.Model(&model.CaseRepository{}).Where("id = ?", id).Update("branches", string(bBytes))
+	}()
+
+	response.Success(c, gin.H{
+		"defaultBranch": defaultBranch,
+		"branches":      branches,
+		"tags":          tags,
+	})
+}
+
+// CreateRepositoryBranch 为仓库切出新分支
+func (h *RepoCaseHandler) CreateRepositoryBranch(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		BranchName string `json:"branchName" binding:"required"`
+		BaseBranch string `json:"baseBranch"`
+		Desc       string `json:"desc"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, 400, "参数错误: "+err.Error())
+		return
+	}
+
+	var repo model.CaseRepository
+	if err := config.DB.Where("id = ?", id).First(&repo).Error; err != nil {
+		response.Fail(c, 404, "用例库不存在")
+		return
+	}
+
+	base := req.BaseBranch
+	if base == "" {
+		base = repo.DefaultBranch
+		if base == "" {
+			base = "main"
+		}
+	}
+
+	// 本地仓库优先切出本地 git 分支
+	if repo.LocalPath != "" {
+		_ = exec.Command("git", "-C", repo.LocalPath, "branch", req.BranchName, base).Run()
+	}
+
+	// 更新数据库 branches 列表
+	var current []string
+	_ = json.Unmarshal([]byte(repo.Branches), &current)
+	found := false
+	for _, b := range current {
+		if b == req.BranchName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		current = append(current, req.BranchName)
+		bBytes, _ := json.Marshal(current)
+		config.DB.Model(&model.CaseRepository{}).Where("id = ?", id).Update("branches", string(bBytes))
+	}
+
+	response.Success(c, true)
+}
+
