@@ -56,6 +56,10 @@ func SetupRouter() *gin.Engine {
 
 		// Case Repository (Test as Code Explorer)
 		rg.GET("/case/repository/list", repoCaseH.ListRepositories)
+		rg.POST("/case/repository/create", repoCaseH.CreateRepository)
+		rg.GET("/case/repository/get-detail/:id", repoCaseH.GetRepositoryDetail)
+		rg.POST("/case/repository/update", repoCaseH.UpdateRepository)
+		rg.POST("/case/repository/delete/:id", repoCaseH.DeleteRepository)
 		rg.GET("/case/repository/:id/tree", repoCaseH.GetRepoTree)
 		rg.GET("/case/repository/:id/cases", repoCaseH.QueryCases)
 		rg.GET("/case/repository/:id/case-detail", repoCaseH.GetCaseDetail)

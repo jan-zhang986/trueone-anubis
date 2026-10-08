@@ -9,19 +9,49 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"trueone-anubis/config"
+	"trueone-anubis/internal/model"
 	"trueone-anubis/internal/response"
 )
 
-type RepoCaseHandler struct {
-	mu sync.RWMutex
-}
+type RepoCaseHandler struct{}
 
 func NewRepoCaseHandler() *RepoCaseHandler {
+	// 自动迁移多代码库数据表
+	if config.DB != nil {
+		_ = config.DB.AutoMigrate(&model.CaseRepository{})
+		ensureDefaultRepo()
+	}
 	return &RepoCaseHandler{}
+}
+
+func ensureDefaultRepo() {
+	var count int64
+	config.DB.Model(&model.CaseRepository{}).Count(&count)
+	if count == 0 {
+		now := time.Now().UnixMilli()
+		defaultRepo := model.CaseRepository{
+			ID:            "repo-trueone-anubis",
+			ProjectID:     "100001100001",
+			Name:          "trueone-anubis (云端核心工程)",
+			Code:          "trueone-anubis",
+			DefaultBranch: "main",
+			Branches:      `["main", "master"]`,
+			Description:   "TrueOne 原生核心后端工程，包含 tests/ 目录下的契约化接口测试用例与 QA 对账规格",
+			GitURL:        "https://github.com/jan-zhang986/trueone-anubis",
+			GitPlatform:   "github",
+			TestsDir:      "tests",
+			LocalPath:     "/Users/zhangjian/vanguard-platform/trueone-anubis",
+			CaseCount:     12,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		config.DB.Create(&defaultRepo)
+	}
 }
 
 type TestCaseStepItem struct {
@@ -63,7 +93,7 @@ type RepoTreeNodeItem struct {
 	ID        string              `json:"id"`
 	Name      string              `json:"name"`
 	Path      string              `json:"path"`
-	Type      string              `json:"type"` // "folder" | "file"
+	Type      string              `json:"type"`
 	CaseCount int                 `json:"caseCount"`
 	PassRate  int                 `json:"passRate,omitempty"`
 	GitURL    string              `json:"gitUrl,omitempty"`
@@ -73,35 +103,24 @@ type RepoTreeNodeItem struct {
 type GitHubContentItem struct {
 	Name        string `json:"name"`
 	Path        string `json:"path"`
-	Type        string `json:"type"` // "dir" | "file"
+	Type        string `json:"type"`
 	Size        int64  `json:"size"`
 	HTMLURL     string `json:"html_url"`
 	DownloadURL string `json:"download_url"`
 }
 
-const (
-	githubOwner = "jan-zhang986"
-	githubRepo  = "trueone-anubis"
-	githubBranch = "main"
-)
-
-func findTestsDir() string {
-	candidates := []string{
-		"tests",
-		"../tests",
-		"/Users/zhangjian/vanguard-platform/trueone-anubis/tests",
+// parseGitHubRepoURL 从任意 GitHub URL 中提取 owner 与 repo
+func parseGitHubRepoURL(rawURL string) (owner string, repo string) {
+	re := regexp.MustCompile(`github\.com/([^/]+)/([^/\.]+)(?:\.git)?`)
+	matches := re.FindStringSubmatch(rawURL)
+	if len(matches) >= 3 {
+		return matches[1], matches[2]
 	}
-	for _, c := range candidates {
-		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
-			abs, _ := filepath.Abs(c)
-			return abs
-		}
-	}
-	return "tests"
+	return "", ""
 }
 
-// parseGoTestContent 从源代码字符串中提取用例元数据与步骤
-func parseGoTestContent(content, relPath string, isCloud bool) []UnifiedTestCaseItem {
+// 从代码文本中解析用例与步骤
+func parseGoTestContent(content, relPath, gitRepoURL, branch string, isCloud bool) []UnifiedTestCaseItem {
 	var result []UnifiedTestCaseItem
 
 	fnRegex := regexp.MustCompile(`(?s)func\s+(Test\w+)\s*\(\s*\w+\s*\*testing\.T\s*\)\s*\{(.+?)(?:\nfunc|\z)`)
@@ -162,7 +181,10 @@ func parseGoTestContent(content, relPath string, isCloud bool) []UnifiedTestCase
 			})
 		}
 
-		cloudWebURL := fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s", githubOwner, githubRepo, githubBranch, relPath)
+		var gitWebURL string
+		if strings.Contains(gitRepoURL, "github.com") {
+			gitWebURL = fmt.Sprintf("%s/blob/%s/%s", strings.TrimSuffix(gitRepoURL, ".git"), branch, relPath)
+		}
 
 		tc := UnifiedTestCaseItem{
 			ID:                caseID,
@@ -173,16 +195,16 @@ func parseGoTestContent(content, relPath string, isCloud bool) []UnifiedTestCase
 			ReqSource:         reqID,
 			Module:            module,
 			Steps:             steps,
-			GitRepo:           fmt.Sprintf("https://github.com/%s/%s", githubOwner, githubRepo),
-			GitBranch:         githubBranch,
+			GitRepo:           gitRepoURL,
+			GitBranch:         branch,
 			GitFilePath:       relPath,
-			GitWebURL:         cloudWebURL,
+			GitWebURL:         gitWebURL,
 			FunctionName:      fnName,
 			ScriptLanguage:    "Go",
 			CodeContent:       "func " + fnName + "(t *testing.T) {" + fnBody,
 			Author:            "TrueOne AI",
 			LastExecutionTime: "刚刚 (最新通过)",
-			ExecutionDuration: "15ms",
+			ExecutionDuration: "12ms",
 			CloudSource:       isCloud,
 		}
 		result = append(result, tc)
@@ -191,20 +213,35 @@ func parseGoTestContent(content, relPath string, isCloud bool) []UnifiedTestCase
 	return result
 }
 
-// fetchCasesFromGitHubCloud 直接从 GitHub 官方 REST API 拉取云端真实代码和测试用例
-func fetchCasesFromGitHubCloud() ([]UnifiedTestCaseItem, *RepoTreeNodeItem, error) {
+// 从 GitHub 云端动态拉取并解析特定仓库
+func fetchCloudRepoCases(repo model.CaseRepository, branch string) ([]UnifiedTestCaseItem, *RepoTreeNodeItem, error) {
+	owner, repoName := parseGitHubRepoURL(repo.GitURL)
+	if owner == "" || repoName == "" {
+		return nil, nil, fmt.Errorf("无法解析 GitHub 仓库地址: %s", repo.GitURL)
+	}
+	if branch == "" {
+		branch = repo.DefaultBranch
+		if branch == "" {
+			branch = "main"
+		}
+	}
+	testsDir := repo.TestsDir
+	if testsDir == "" {
+		testsDir = "tests"
+	}
+
 	client := &http.Client{Timeout: 4 * time.Second}
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/tests", githubOwner, githubRepo)
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", owner, repoName, testsDir, branch)
 
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	req.Header.Set("User-Agent", "TrueOne-Platform/2.0")
+	req.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
 
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("github api unavailable: %v", err)
+		return nil, nil, fmt.Errorf("github api 请求失败: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -217,51 +254,41 @@ func fetchCasesFromGitHubCloud() ([]UnifiedTestCaseItem, *RepoTreeNodeItem, erro
 	var allCases []UnifiedTestCaseItem
 	fileCaseMap := make(map[string]int)
 
-	// 对每个 .go 文件拉取云端内容
 	for _, item := range items {
 		if item.Type == "file" && strings.HasSuffix(item.Name, "_test.go") && item.DownloadURL != "" {
 			fileResp, err := client.Get(item.DownloadURL)
 			if err == nil && fileResp.StatusCode == http.StatusOK {
 				fBytes, _ := io.ReadAll(fileResp.Body)
 				_ = fileResp.Body.Close()
-				cases := parseGoTestContent(string(fBytes), item.Path, true)
+				cases := parseGoTestContent(string(fBytes), item.Path, repo.GitURL, branch, true)
 				fileCaseMap[item.Name] = len(cases)
 				allCases = append(allCases, cases...)
 			}
 		}
 	}
 
-	// 组装云端目录树
 	root := &RepoTreeNodeItem{
 		ID:        "root",
-		Name:      "tests (GitHub 云端主干)",
-		Path:      "tests",
+		Name:      fmt.Sprintf("%s (%s 云端分支)", testsDir, branch),
+		Path:      testsDir,
 		Type:      "folder",
 		CaseCount: len(allCases),
 		PassRate:  100,
-		GitURL:    fmt.Sprintf("https://github.com/%s/%s/tree/%s/tests", githubOwner, githubRepo, githubBranch),
+		GitURL:    fmt.Sprintf("https://github.com/%s/%s/tree/%s/%s", owner, repoName, branch, testsDir),
 		Children:  []*RepoTreeNodeItem{},
 	}
 
-	// 挂载云端 QA 需求目录
-	qaNode := &RepoTreeNodeItem{
-		ID:        "folder-qa",
-		Name:      "qa (需求规格对账)",
-		Path:      "tests/qa",
-		Type:      "folder",
-		CaseCount: 3,
-		GitURL:    fmt.Sprintf("https://github.com/%s/%s/tree/%s/tests/qa", githubOwner, githubRepo, githubBranch),
-		Children: []*RepoTreeNodeItem{
-			{ID: "req-auth", Name: "REQ-AUTH-001 (认证安全规格)", Path: "tests/qa/REQ-AUTH-001", Type: "folder", CaseCount: 4, GitURL: fmt.Sprintf("https://github.com/%s/%s/tree/%s/tests/qa/REQ-AUTH-001", githubOwner, githubRepo, githubBranch)},
-			{ID: "req-org", Name: "REQ-ORG-001 (组织多租户规格)", Path: "tests/qa/REQ-ORG-001", Type: "folder", CaseCount: 4, GitURL: fmt.Sprintf("https://github.com/%s/%s/tree/%s/tests/qa/REQ-ORG-001", githubOwner, githubRepo, githubBranch)},
-			{ID: "req-prj", Name: "REQ-PRJ-001 (项目生命周期规格)", Path: "tests/qa/REQ-PRJ-001", Type: "folder", CaseCount: 4, GitURL: fmt.Sprintf("https://github.com/%s/%s/tree/%s/tests/qa/REQ-PRJ-001", githubOwner, githubRepo, githubBranch)},
-		},
-	}
-	root.Children = append(root.Children, qaNode)
-
-	// 挂载云端测试文件
 	for _, item := range items {
-		if item.Type == "file" && strings.HasSuffix(item.Name, "_test.go") {
+		if item.Type == "dir" {
+			root.Children = append(root.Children, &RepoTreeNodeItem{
+				ID:        "folder-" + item.Name,
+				Name:      item.Name,
+				Path:      item.Path,
+				Type:      "folder",
+				CaseCount: 0,
+				GitURL:    item.HTMLURL,
+			})
+		} else if strings.HasSuffix(item.Name, "_test.go") {
 			count := fileCaseMap[item.Name]
 			root.Children = append(root.Children, &RepoTreeNodeItem{
 				ID:        "file-" + item.Name,
@@ -278,15 +305,17 @@ func fetchCasesFromGitHubCloud() ([]UnifiedTestCaseItem, *RepoTreeNodeItem, erro
 	return allCases, root, nil
 }
 
-// 统一获取用例（优先云端，脱机优雅降级为本地）
-func getAllCasesUnified() ([]UnifiedTestCaseItem, *RepoTreeNodeItem) {
-	cases, tree, err := fetchCasesFromGitHubCloud()
-	if err == nil && len(cases) > 0 {
-		return cases, tree
+// 本地扫描回退/本地工作区扫描
+func fetchLocalRepoCases(repo model.CaseRepository, branch string) ([]UnifiedTestCaseItem, *RepoTreeNodeItem, error) {
+	basePath := repo.LocalPath
+	if basePath == "" {
+		basePath = "/Users/zhangjian/vanguard-platform/trueone-anubis"
+	}
+	testsDir := filepath.Join(basePath, repo.TestsDir)
+	if _, err := os.Stat(testsDir); err != nil {
+		testsDir = filepath.Join(basePath, "tests")
 	}
 
-	// 降级本地扫描
-	testsDir := findTestsDir()
 	var allCases []UnifiedTestCaseItem
 	fileCaseMap := make(map[string]int)
 
@@ -295,9 +324,9 @@ func getAllCasesUnified() ([]UnifiedTestCaseItem, *RepoTreeNodeItem) {
 			return nil
 		}
 		if strings.HasSuffix(info.Name(), "_test.go") {
-			rel, _ := filepath.Rel(filepath.Dir(testsDir), path)
+			rel, _ := filepath.Rel(basePath, path)
 			bytes, _ := os.ReadFile(path)
-			cList := parseGoTestContent(string(bytes), rel, false)
+			cList := parseGoTestContent(string(bytes), rel, repo.GitURL, branch, false)
 			fileCaseMap[info.Name()] = len(cList)
 			allCases = append(allCases, cList...)
 		}
@@ -306,37 +335,31 @@ func getAllCasesUnified() ([]UnifiedTestCaseItem, *RepoTreeNodeItem) {
 
 	root := &RepoTreeNodeItem{
 		ID:        "root",
-		Name:      "tests (本地工作区)",
-		Path:      "tests",
+		Name:      fmt.Sprintf("%s (本地扫描)", repo.TestsDir),
+		Path:      repo.TestsDir,
 		Type:      "folder",
 		CaseCount: len(allCases),
 		PassRate:  100,
 		Children:  []*RepoTreeNodeItem{},
 	}
 
-	qaNode := &RepoTreeNodeItem{
-		ID:        "folder-qa",
-		Name:      "qa (需求规格对账)",
-		Path:      "tests/qa",
-		Type:      "folder",
-		CaseCount: 3,
-		Children: []*RepoTreeNodeItem{
-			{ID: "req-auth", Name: "REQ-AUTH-001 (认证安全规格)", Path: "tests/qa/REQ-AUTH-001", Type: "folder", CaseCount: 4},
-			{ID: "req-org", Name: "REQ-ORG-001 (组织多租户规格)", Path: "tests/qa/REQ-ORG-001", Type: "folder", CaseCount: 4},
-			{ID: "req-prj", Name: "REQ-PRJ-001 (项目生命周期规格)", Path: "tests/qa/REQ-PRJ-001", Type: "folder", CaseCount: 4},
-		},
-	}
-	root.Children = append(root.Children, qaNode)
-
 	entries, _ := os.ReadDir(testsDir)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !entry.IsDir() && strings.HasSuffix(name, "_test.go") {
+		if entry.IsDir() {
+			root.Children = append(root.Children, &RepoTreeNodeItem{
+				ID:        "folder-" + name,
+				Name:      name,
+				Path:      filepath.Join(repo.TestsDir, name),
+				Type:      "folder",
+				CaseCount: 0,
+			})
+		} else if strings.HasSuffix(name, "_test.go") {
 			count := fileCaseMap[name]
 			root.Children = append(root.Children, &RepoTreeNodeItem{
 				ID:        "file-" + name,
 				Name:      name,
-				Path:      "tests/" + name,
+				Path:      filepath.Join(repo.TestsDir, name),
 				Type:      "file",
 				CaseCount: count,
 				PassRate:  100,
@@ -344,46 +367,224 @@ func getAllCasesUnified() ([]UnifiedTestCaseItem, *RepoTreeNodeItem) {
 		}
 	}
 
-	return allCases, root
+	return allCases, root, nil
 }
 
-// ListRepositories 获取用例库列表
-func (h *RepoCaseHandler) ListRepositories(c *gin.Context) {
-	allCases, _ := getAllCasesUnified()
-	caseCount := len(allCases)
-
-	repoList := []map[string]any{
-		{
-			"id":            "repo-trueone-anubis",
-			"name":          "trueone-anubis (云端核心工程)",
-			"code":          "trueone-anubis",
-			"defaultBranch": "main",
-			"branches":      []string{"main", "master"},
-			"description":   "TrueOne 原生云端工程，已接入 GitHub 云端 API 实时同步 tests/ 目录契约化用例与 QA 对账资产",
-			"gitUrl":        fmt.Sprintf("https://github.com/%s/%s", githubOwner, githubRepo),
-			"gitPlatform":   "github",
-			"testsDir":      "tests",
-			"caseCount":     caseCount,
-			"updatedAt":     int64(1791448800000),
-		},
+// 统一动态检索特定仓库用例与树
+func getRepoCasesDynamic(repoID, branch string) ([]UnifiedTestCaseItem, *RepoTreeNodeItem) {
+	var repo model.CaseRepository
+	err := config.DB.Where("id = ?", repoID).First(&repo).Error
+	if err != nil {
+		// 查不到则取默认第一条
+		config.DB.Order("created_at ASC").First(&repo)
 	}
 
-	response.Success(c, repoList)
+	if branch == "" {
+		branch = repo.DefaultBranch
+		if branch == "" {
+			branch = "main"
+		}
+	}
+
+	// 如果配置了 GitHub 地址，优先从 GitHub 云端动态拉取
+	if strings.Contains(repo.GitURL, "github.com") {
+		cases, tree, err := fetchCloudRepoCases(repo, branch)
+		if err == nil && len(cases) > 0 {
+			return cases, tree
+		}
+	}
+
+	// 否则或降级执行本地扫描
+	cases, tree, _ := fetchLocalRepoCases(repo, branch)
+	return cases, tree
 }
 
-// GetRepoTree 获取用例库目录树
+// --- 接口实现 ---
+
+// ListRepositories 获取当前项目的所有用例库列表
+func (h *RepoCaseHandler) ListRepositories(c *gin.Context) {
+	projectID := c.Query("projectId")
+	if projectID == "" {
+		projectID = "100001100001"
+	}
+
+	var repos []model.CaseRepository
+	config.DB.Where("project_id = ?", projectID).Order("created_at ASC").Find(&repos)
+	if len(repos) == 0 {
+		config.DB.Order("created_at ASC").Find(&repos)
+	}
+
+	type RepoDTO struct {
+		ID            string   `json:"id"`
+		Name          string   `json:"name"`
+		Code          string   `json:"code"`
+		DefaultBranch string   `json:"defaultBranch"`
+		Branches      []string `json:"branches"`
+		Description   string   `json:"description"`
+		GitURL        string   `json:"gitUrl"`
+		GitPlatform   string   `json:"gitPlatform"`
+		TestsDir      string   `json:"testsDir"`
+		LocalPath     string   `json:"localPath"`
+		CaseCount     int      `json:"caseCount"`
+		UpdatedAt     int64    `json:"updatedAt"`
+	}
+
+	list := make([]RepoDTO, 0, len(repos))
+	for _, r := range repos {
+		var branchList []string
+		_ = json.Unmarshal([]byte(r.Branches), &branchList)
+		if len(branchList) == 0 {
+			branchList = []string{"main", "master"}
+		}
+
+		list = append(list, RepoDTO{
+			ID:            r.ID,
+			Name:          r.Name,
+			Code:          r.Code,
+			DefaultBranch: r.DefaultBranch,
+			Branches:      branchList,
+			Description:   r.Description,
+			GitURL:        r.GitURL,
+			GitPlatform:   r.GitPlatform,
+			TestsDir:      r.TestsDir,
+			LocalPath:     r.LocalPath,
+			CaseCount:     r.CaseCount,
+			UpdatedAt:     r.UpdatedAt,
+		})
+	}
+
+	response.Success(c, list)
+}
+
+// CreateRepository 关联并创建新的代码工程用例库 (支持任意云端 Git URL 或本地路径)
+func (h *RepoCaseHandler) CreateRepository(c *gin.Context) {
+	var body struct {
+		Name          string `json:"name" binding:"required"`
+		LocalPath     string `json:"localPath"`
+		GitURL        string `json:"gitUrl"`
+		DefaultBranch string `json:"defaultBranch"`
+		TestsDir      string `json:"testsDir"`
+		Description   string `json:"description"`
+		ProjectID     string `json:"projectId"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.Fail(c, 400, "参数错误: "+err.Error())
+		return
+	}
+
+	now := time.Now().UnixMilli()
+	repoID := fmt.Sprintf("repo-%s", uuid.New().String()[:8])
+	branch := body.DefaultBranch
+	if branch == "" {
+		branch = "main"
+	}
+	testsDir := body.TestsDir
+	if testsDir == "" {
+		testsDir = "tests"
+	}
+	projectID := body.ProjectID
+	if projectID == "" {
+		projectID = "100001100001"
+	}
+
+	gitURL := body.GitURL
+	localPath := body.LocalPath
+	gitPlatform := "local"
+
+	// 智能识别输入的 URL / 路径类型
+	inputAddr := gitURL
+	if inputAddr == "" {
+		inputAddr = localPath
+	}
+	if strings.Contains(inputAddr, "github.com") {
+		gitPlatform = "github"
+		gitURL = inputAddr
+	} else if strings.HasPrefix(inputAddr, "http") || strings.HasPrefix(inputAddr, "git@") {
+		gitPlatform = "gitlab"
+		gitURL = inputAddr
+	} else {
+		localPath = inputAddr
+	}
+
+	newRepo := model.CaseRepository{
+		ID:            repoID,
+		ProjectID:     projectID,
+		Name:          body.Name,
+		Code:          strings.ToLower(strings.ReplaceAll(body.Name, " ", "-")),
+		DefaultBranch: branch,
+		Branches:      `["main", "master", "develop"]`,
+		Description:   body.Description,
+		GitURL:        gitURL,
+		GitPlatform:   gitPlatform,
+		TestsDir:      testsDir,
+		LocalPath:     localPath,
+		CaseCount:     0,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	if err := config.DB.Create(&newRepo).Error; err != nil {
+		response.Fail(c, 500, "保存用例库失败: "+err.Error())
+		return
+	}
+
+	// 立即触发一次动态扫描计算用例数
+	cases, _ := getRepoCasesDynamic(repoID, branch)
+	if len(cases) > 0 {
+		config.DB.Model(&newRepo).Update("case_count", len(cases))
+		newRepo.CaseCount = len(cases)
+	}
+
+	response.Success(c, newRepo)
+}
+
+// GetRepositoryDetail 获取指定仓库详情
+func (h *RepoCaseHandler) GetRepositoryDetail(c *gin.Context) {
+	id := c.Param("id")
+	var repo model.CaseRepository
+	if err := config.DB.Where("id = ?", id).First(&repo).Error; err != nil {
+		response.Fail(c, 404, "用例库不存在")
+		return
+	}
+	response.Success(c, repo)
+}
+
+// UpdateRepository 更新仓库配置
+func (h *RepoCaseHandler) UpdateRepository(c *gin.Context) {
+	var body model.CaseRepository
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.Fail(c, 400, "参数错误")
+		return
+	}
+	body.UpdatedAt = time.Now().UnixMilli()
+	config.DB.Model(&model.CaseRepository{}).Where("id = ?", body.ID).Updates(body)
+	response.Success(c, "更新成功")
+}
+
+// DeleteRepository 删除代码库关联
+func (h *RepoCaseHandler) DeleteRepository(c *gin.Context) {
+	id := c.Param("id")
+	config.DB.Where("id = ?", id).Delete(&model.CaseRepository{})
+	response.Success(c, true)
+}
+
+// GetRepoTree 获取用例库目录树 (根据 :id 动态解析)
 func (h *RepoCaseHandler) GetRepoTree(c *gin.Context) {
-	_, root := getAllCasesUnified()
+	id := c.Param("id")
+	branch := c.Query("branch")
+	_, root := getRepoCasesDynamic(id, branch)
 	response.Success(c, root)
 }
 
-// QueryCases 查询用例列表
+// QueryCases 查询特定仓库的用例列表 (根据 :id 动态解析)
 func (h *RepoCaseHandler) QueryCases(c *gin.Context) {
+	id := c.Param("id")
+	branch := c.Query("branch")
 	dirPath := c.Query("dirPath")
 	keyword := strings.ToLower(strings.TrimSpace(c.Query("keyword")))
 	priority := strings.ToUpper(strings.TrimSpace(c.Query("priority")))
 
-	allCases, _ := getAllCasesUnified()
+	allCases, _ := getRepoCasesDynamic(id, branch)
 
 	var filtered []UnifiedTestCaseItem
 	for _, tc := range allCases {
@@ -405,15 +606,16 @@ func (h *RepoCaseHandler) QueryCases(c *gin.Context) {
 	response.Success(c, map[string]any{
 		"total":    len(filtered),
 		"page":     1,
-		"pageSize": 50,
+		"pageSize": 100,
 		"records":  filtered,
 	})
 }
 
-// GetCaseDetail 获取单个用例详情
+// GetCaseDetail 获取单个用例详情 (根据 :id 动态解析)
 func (h *RepoCaseHandler) GetCaseDetail(c *gin.Context) {
+	id := c.Param("id")
 	caseID := c.Query("caseId")
-	allCases, _ := getAllCasesUnified()
+	allCases, _ := getRepoCasesDynamic(id, "")
 
 	for _, tc := range allCases {
 		if tc.ID == caseID || tc.Code == caseID {
@@ -425,7 +627,13 @@ func (h *RepoCaseHandler) GetCaseDetail(c *gin.Context) {
 	response.Fail(c, 404, "用例不存在")
 }
 
-// SyncRepository 触发重新扫描
+// SyncRepository 触发指定仓库重新扫描
 func (h *RepoCaseHandler) SyncRepository(c *gin.Context) {
+	id := c.Param("id")
+	branch := c.Query("branch")
+	cases, _ := getRepoCasesDynamic(id, branch)
+	if len(cases) > 0 {
+		config.DB.Model(&model.CaseRepository{}).Where("id = ?", id).Update("case_count", len(cases))
+	}
 	response.Success(c, true)
 }
