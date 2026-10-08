@@ -1,0 +1,19 @@
+server:
+  port: 8081
+
+database:
+  host: 127.0.0.1
+  port: 3307
+  user: root
+  password: root
+  dbname: aegis
+  charset: utf8mb4
+  parseTime: true
+  loc: Local
+
+auth:
+  jwt_secret: "trueone_anubis_jwt_secret_key_2026"
+  token_expire_hours: 72
+
+security:
+  default_admin_password: "trueone"

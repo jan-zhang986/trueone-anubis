@@ -1,0 +1,781 @@
+[
+  {
+    "id": "sec-case-page",
+    "sectionNumber": "4.1",
+    "lineStart": 21,
+    "lineEnd": 34,
+    "title": "功能用例分页查询（GetCasePage：值传递参数、空列表与分页元数据）",
+    "paragraphs": [
+      "POST /functional/case/page 与 POST /testcase/page 共用 handler.TestCaseHandler.GetCasePage，入参经 c.ShouldBindJSON 绑定到 service.CasePageParams（json: projectId/moduleIds/keyword/current/pageSize），projectId 为空时回落到 c.GetHeader(\"PROJECT\")，绑定错误被 _ = 丢弃（handler/test_case.go:22-26，router.go:92-93）。",
+      "GetCasePage(params CasePageParams) 是值传递：service 内部把 Current<=0 兜底为 1、PageSize<=0 兜底为 10，但 handler 第 33 行把未兜底的 params.Current/params.PageSize 交给 response.SuccessPage；而 PageResult 的 current/pageSize/totalPages 都带 omitempty，因此未显式传分页参数时这三个字段会从 JSON 中整体消失。",
+      "service/test_case.go:33 声明 var list []model.FunctionalCase，Find 命中 0 行时 list 为 nil，data.list 序列化为 null；查询条件为 deleted = 0，projectId 为空时不加 project_id 约束（service/test_case.go:36-49）。",
+      "query.Count(&total) 与随后复用同一个 *gorm.DB 的 Find 未使用 Session/事务，count 与分页结果之间无一致性保证（service/test_case.go:47-49）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-case-page",
+      "title": "分页元数据丢失 + 空列表 null 化导致用例列表页渲染失败",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/分页一致性",
+      "riskDescription": "请求体不含 current/pageSize（或把 current 传成字符串 \"2\"，encoding/json 抛 UnmarshalTypeError 后被第 23 行的 _ = 吞掉）时，服务端按 current=1/pageSize=10 查询，却把 0 值传给 SuccessPage；由于 current/pageSize/totalPages 带 omitempty，响应体里根本没有这三个键，前端分页组件读到 undefined 后页码条消失、总页数 NaN，用户以为只有一页。空项目下 data.list 为 null（var list []model.FunctionalCase），前端 list.map(...) 抛 TypeError: Cannot read properties of null，整个功能用例页白屏。",
+      "impactScope": [
+        "handler.TestCaseHandler.GetCasePage",
+        "service.TestCaseService.GetCasePage",
+        "handler/test_case.go:33",
+        "service/test_case.go:33",
+        "response.SuccessPage",
+        "response.PageResult.Current",
+        "functional_case"
+      ],
+      "strategy": "起独立测试库 aegis_test 并 AutoMigrate functional_case；用 httptest + gin 直接挂载 r.POST(\"/functional/case/page\", NewTestCaseHandler().GetCasePage)；(1) 清空 projectId=p-empty 的数据后请求，断言原始响应体中 data.list 的字面量为 []；(2) 插入 11 行后请求 pageSize=10/current=2，断言 data.total=11、data.totalPages=2、data.list 长度 1；(3) 发送省略 current/pageSize 的请求，断言响应体包含 current 与 pageSize 键且值为 1/10；同时用 SQL SELECT COUNT(*) FROM functional_case WHERE project_id = ? AND deleted = 0 与 data.total 交叉核对。",
+      "verificationChecklist": [
+        "空结果集下 data.list 必须序列化为 []（非 null），且 total=0、totalPages=0",
+        "未传分页参数时响应必须回显 current=1、pageSize=10，且 totalPages 按实际 pageSize 计算（11 行 → 2 页）",
+        "current/pageSize 传字符串类型时不得静默降级为第 1 页：需返回 400 或显式纠正并在响应中回显真实生效值",
+        "count 与 list 必须同源一致：SQL COUNT(*) == data.total，且 list 长度 == min(pageSize, total-offset)"
+      ],
+      "cases": [
+        {
+          "id": "tc-case-page-01",
+          "name": "test_get_case_page_empty_project_list_must_be_empty_array",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_page_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupCasePageTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.FunctionalCase{}); err != nil {\n\t\tt.Fatalf(\"automigrate functional_case: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestGetCasePage_EmptyProject_ListMustBeEmptyArray(t *testing.T) {\n\tdb := setupCasePageTestDB(t)\n\tif err := db.Exec(\"DELETE FROM functional_case WHERE project_id = ?\", \"p-empty\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/functional/case/page\", NewTestCaseHandler().GetCasePage)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/functional/case/page\", bytes.NewReader([]byte(`{\"projectId\":\"p-empty\",\"current\":1,\"pageSize\":10}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode    int             `json:\"code\"`\n\t\tData    json.RawMessage `json:\"data\"`\n\t\tMessage string          `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif w.Code != http.StatusOK || envelope.Code != 200 {\n\t\tt.Fatalf(\"http=%d code=%d message=%s\", w.Code, envelope.Code, envelope.Message)\n\t}\n\n\tvar page struct {\n\t\tList       json.RawMessage `json:\"list\"`\n\t\tTotal      int64           `json:\"total\"`\n\t\tCurrent    *int            `json:\"current\"`\n\t\tPageSize   *int            `json:\"pageSize\"`\n\t\tTotalPages int64           `json:\"totalPages\"`\n\t}\n\tif err := json.Unmarshal(envelope.Data, &page); err != nil {\n\t\tt.Fatalf(\"page unmarshal: %v data=%s\", err, string(envelope.Data))\n\t}\n\tif got := string(bytes.TrimSpace(page.List)); got != \"[]\" {\n\t\tt.Errorf(\"契约破坏: data.list=%s, want [] (var list []model.FunctionalCase 为 nil 时序列化成 null)\", got)\n\t}\n\tif page.Total != 0 || page.TotalPages != 0 {\n\t\tt.Errorf(\"空结果分页元数据错误: total=%d totalPages=%d, want 0/0\", page.Total, page.TotalPages)\n\t}\n\tif page.Current == nil || *page.Current != 1 {\n\t\tt.Errorf(\"分页元数据缺失: current=%v, want 1 (PageResult.Current 带 omitempty, 0 值被省略)\", page.Current)\n\t}\n\tif page.PageSize == nil || *page.PageSize != 10 {\n\t\tt.Errorf(\"分页元数据缺失: pageSize=%v, want 10\", page.PageSize)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "code == 200；data.list 原始 JSON 字面量 == \"[]\"；data.total == 0；data.totalPages == 0；data.current == 1；data.pageSize == 10",
+            "dbStateDiff": "[READ-ONLY] 仅 SELECT COUNT(*) 级别读取 functional_case，测试前后行数与 deleted 标志均不变",
+            "traceLog": "期望 HTTP 200、body.code=200、message=success，P99 < 50ms；Gin 访问日志出现 POST /functional/case/page 200"
+          }
+        },
+        {
+          "id": "tc-case-page-02",
+          "name": "test_get_case_page_missing_paging_params_must_echo_effective_meta",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_page_meta_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupCasePageMetaTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.FunctionalCase{}); err != nil {\n\t\tt.Fatalf(\"automigrate functional_case: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestGetCasePage_MissingPagingParams_MustEchoEffectiveMeta(t *testing.T) {\n\tdb := setupCasePageMetaTestDB(t)\n\tif err := db.Exec(\"DELETE FROM functional_case WHERE project_id = ?\", \"p-meta\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tfor i := 0; i < 11; i++ {\n\t\trow := model.FunctionalCase{\n\t\t\tID:        \"page-meta-\" + string(rune('a'+i)),\n\t\t\tProjectID: \"p-meta\",\n\t\t\tModuleID:  \"mod-1\",\n\t\t\tName:      \"分页用例\",\n\t\t\tDeleted:   model.BitBool(false),\n\t\t\tCreatedAt: int64(1000 + i),\n\t\t\tUpdatedAt: int64(1000 + i),\n\t\t}\n\t\tif err := db.Create(&row).Error; err != nil {\n\t\t\tt.Fatalf(\"seed %d: %v\", i, err)\n\t\t}\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/functional/case/page\", NewTestCaseHandler().GetCasePage)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/functional/case/page\", bytes.NewReader([]byte(`{\"projectId\":\"p-meta\",\"keyword\":\"分页\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode int             `json:\"code\"`\n\t\tData json.RawMessage `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tvar page struct {\n\t\tTotal      int64 `json:\"total\"`\n\t\tTotalPages int64 `json:\"totalPages\"`\n\t\tCurrent    *int  `json:\"current\"`\n\t\tPageSize   *int  `json:\"pageSize\"`\n\t}\n\tif err := json.Unmarshal(envelope.Data, &page); err != nil {\n\t\tt.Fatalf(\"page unmarshal: %v data=%s\", err, string(envelope.Data))\n\t}\n\tif page.Current == nil {\n\t\tt.Errorf(\"响应缺少 current 字段: GetCasePage 值传递, service 兜底后的 1/10 没有回写到 handler 的 params\")\n\t} else if *page.Current != 1 {\n\t\tt.Errorf(\"current=%d, want 1\", *page.Current)\n\t}\n\tif page.PageSize == nil {\n\t\tt.Errorf(\"响应缺少 pageSize 字段: response.PageResult.PageSize 带 omitempty, 0 值被省略\")\n\t} else if *page.PageSize != 10 {\n\t\tt.Errorf(\"pageSize=%d, want 10\", *page.PageSize)\n\t}\n\tif page.Total != 11 || page.TotalPages != 2 {\n\t\tt.Errorf(\"分页元数据错误: total=%d totalPages=%d, want 11/2\", page.Total, page.TotalPages)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "data.current 必须存在且 == 1；data.pageSize 必须存在且 == 10；data.total == 11；data.totalPages == 2",
+            "dbStateDiff": "[READ-ONLY] SELECT COUNT(*) 校验 functional_case WHERE project_id='p-meta' AND deleted=0 为 11 行，测试不写入",
+            "traceLog": "期望 HTTP 200、body.code=200；若出现 data.current 缺键则记录响应原文用于前端兼容性回归"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "仓库内不存在任何 *_test.go（go test ./... 无测试目标），用例分页的前端契约从未被固化，omitempty 吞字段与 nil 切片问题因此长期不可见。",
+        "onlineMonitoring": "在网关/中间件层对 /functional/case/page 响应做 JSON Schema 校验，data.list 为 null 或缺少 current/pageSize 时打点告警；同时上报前端 window.onerror 中 Cannot read properties of null (reading map) 的错误率。"
+      }
+    }
+  },
+  {
+    "id": "sec-case-detail",
+    "sectionNumber": "4.2",
+    "lineStart": 36,
+    "lineEnd": 51,
+    "title": "用例详情读取（GetCaseDetail：POST 无 body、GET query 回落与软删可见性）",
+    "paragraphs": [
+      "POST /functional/case/detail 与 GET /functional/case/detail 共用 GetCaseDetail：先 c.ShouldBindJSON(&body) 取 json: id，绑定失败被 _ = 忽略，再回落 c.Query(\"id\")（handler/test_case.go:36-43，router.go:95-96）。",
+      "service.GetCaseDetail 用 Where(\"id = ? AND deleted = 0\").First(&c)，ErrRecordNotFound 时 handler 统一返回 response.Fail(c, 404, \"用例不存在\")（service/test_case.go:54-61，handler/test_case.go:45-49）。",
+      "response.Fail 固定以 HTTP 200 输出 {code:404, data:null, message}，业务错误码只在 body.code 中体现；查询条件不含 project_id，任何凭证只要知道 id 即可读取任意项目的用例详情。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-case-detail",
+      "title": "详情接口错误语义与 id 来源混用导致的契约歧义和跨项目读取",
+      "riskLevel": "P2",
+      "riskTag": "边界/契约破坏",
+      "riskDescription": "POST 分支在没有请求体时 ShouldBindJSON 返回 EOF 被 _ = 吞掉，body.ID 退化为空串：此时若前端也忘了带 query，请求会走到 GetCaseDetail(\"\")，GORM 生成 WHERE id = '' AND deleted = 0 并返回 ErrRecordNotFound，接口回 404「用例不存在」——把参数缺失伪装成资源不存在，前端无法区分「ID 传丢了」与「用例被删了」。HTTP 状态恒为 200，若前端依赖 http status 判错会误判成功。同时 First 只按 id 过滤、无 project_id/租户约束，跨项目读取用例详情（含 name、moduleId、tags 等）属于越权信息泄漏。",
+      "impactScope": [
+        "handler.TestCaseHandler.GetCaseDetail",
+        "service.TestCaseService.GetCaseDetail",
+        "handler/test_case.go:40",
+        "service/test_case.go:56",
+        "response.Fail",
+        "functional_case"
+      ],
+      "strategy": "httptest 挂载 GET 与 POST 两个路由：(1) 造一条 deleted=1 的用例，GET /functional/case/detail?id=<id> 断言 body.code=404 且 data 字面量为 null、HTTP 200；(2) POST 空 body 且不带 query，断言不得 panic 且 code 为 400（参数缺失）而非 404；(3) 造 project_id=orgB-project 的用例，带 PROJECT: orgA-project 请求其 id，断言要么 404 要么数据被拒绝，用于固化越权边界。",
+      "verificationChecklist": [
+        "软删除用例（deleted=1）详情必须返回 code=404、data=null",
+        "POST 无 body 且无 query id 时必须返回参数错误（400）而非 404，且不得触发空 id 查询",
+        "详情读取必须带上 project_id/组织维度的租户约束，跨项目 id 不得回显记录",
+        "响应信封恒为 HTTP 200 + {code,data,message}，前端不得依赖 HTTP status 判错"
+      ],
+      "cases": [
+        {
+          "id": "tc-case-detail-01",
+          "name": "test_get_case_detail_soft_deleted_and_missing_id_contract",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_detail_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupCaseDetailTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.FunctionalCase{}); err != nil {\n\t\tt.Fatalf(\"automigrate functional_case: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestGetCaseDetail_SoftDeleted_MustReturnEnvelope404(t *testing.T) {\n\tdb := setupCaseDetailTestDB(t)\n\tif err := db.Exec(\"DELETE FROM functional_case WHERE id = ?\", \"case-soft-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.FunctionalCase{\n\t\tID:        \"case-soft-1\",\n\t\tProjectID: \"p1\",\n\t\tName:      \"已删除用例\",\n\t\tDeleted:   model.BitBool(true),\n\t\tCreatedAt: 1,\n\t\tUpdatedAt: 1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.GET(\"/functional/case/detail\", NewTestCaseHandler().GetCaseDetail)\n\tr.POST(\"/functional/case/detail\", NewTestCaseHandler().GetCaseDetail)\n\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/functional/case/detail?id=case-soft-1\", nil))\n\tvar envelope struct {\n\t\tCode    int             `json:\"code\"`\n\t\tData    json.RawMessage `json:\"data\"`\n\t\tMessage string          `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif w.Code != http.StatusOK {\n\t\tt.Errorf(\"响应信封约定: http=%d, want 200 (业务错误码放在 body.code)\", w.Code)\n\t}\n\tif envelope.Code != 404 {\n\t\tt.Errorf(\"软删用例必须不可见: code=%d message=%s, want 404\", envelope.Code, envelope.Message)\n\t}\n\tif got := string(bytes.TrimSpace(envelope.Data)); got != \"null\" {\n\t\tt.Errorf(\"失败响应 data=%s, want null\", got)\n\t}\n\n\tw2 := httptest.NewRecorder()\n\treq2 := httptest.NewRequest(http.MethodPost, \"/functional/case/detail\", bytes.NewReader([]byte(`{}`)))\n\treq2.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w2, req2)\n\tvar envelope2 struct {\n\t\tCode    int    `json:\"code\"`\n\t\tMessage string `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w2.Body.Bytes(), &envelope2); err != nil {\n\t\tt.Fatalf(\"envelope2 unmarshal: %v body=%s\", err, w2.Body.String())\n\t}\n\tif envelope2.Code == 404 {\n\t\tt.Errorf(\"缺失 id 被误报为资源不存在: code=404 message=%s (ShouldBindJSON 错误被 _ = 忽略后以空串查询)\", envelope2.Message)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "GET 已删除用例 → HTTP 200 且 body.code == 404 且 data 字面量 == \"null\"；POST 空 body 无 query → body.code != 404（应为 400 参数错误）",
+            "dbStateDiff": "[READ-ONLY] 仅读取 functional_case，测试前后 deleted/updated_at 不变",
+            "traceLog": "期望两条请求均 200，日志中出现 message=用例不存在；不应出现 SQL 语法错误或 500"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试与契约文档，POST/GET 双入口的 id 来源优先级与 404 语义仅存在于代码实现里。",
+        "onlineMonitoring": "对 /functional/case/detail 的 code=404 比例与 code=400 比例分别打点；404 突增通常意味着前端 id 丢失或软删数据被反复访问。"
+      }
+    }
+  },
+  {
+    "id": "sec-case-crud",
+    "sectionNumber": "4.3",
+    "lineStart": 53,
+    "lineEnd": 120,
+    "title": "用例增改删（AddCase/UpdateCase/DeleteCase：批量赋值、无租户约束与静默零行更新）",
+    "paragraphs": [
+      "AddCase/UpdateCase 直接把 c.ShouldBindJSON 绑定到 model.FunctionalCase 全量结构体（含 id/num/projectId/deleted/createUser/createdAt），仅 projectId 为空时回落到 c.GetHeader(\"PROJECT\")（handler/test_case.go:53-99）。",
+      "service.AddCase 只补 ID/CreateUser/UpdateUser/CreatedAt/UpdatedAt 及 ReviewStatus=UN_REVIEWED、LastExecuteResult=UN_EXECUTED，不校验 Name/ModuleID/ProjectID 是否为空，Num 完全由客户端提供（service/test_case.go:63-79）。",
+      "UpdateCase 与 DeleteCase 的 Where 只有 id，没有 project_id 也没有 deleted = 0；UpdateCase 走 Updates(c) 结构体更新（GORM 跳过零值字段），DeleteCase 走 Updates(map) 写入 deleted=1/delete_time/delete_user（service/test_case.go:81-95）。",
+      "handler 侧三个写接口在 ShouldBindJSON 失败时返回 400，但 DeleteCase 的 _ = c.ShouldBindJSON(&body) 忽略错误，body.ID 为空串时仍会执行删除并返回 200「删除成功」，同时始终写入 RecordAuditLog（handler/test_case.go:101-120）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-case-crud",
+      "title": "用例写路径越权（仅按 id 定位）与零行更新仍报成功",
+      "riskLevel": "P0",
+      "riskTag": "越权/数据污染",
+      "riskDescription": "UpdateCase/DeleteCase 只按 id 过滤，未校验记录归属项目：携带任一项目 PROJECT 头（甚至匿名，AuthMiddleware 在无 token 时不设置 userId，handler 回落 uid=admin）即可改写或软删其它项目的用例，属于典型 IDOR/跨租户数据污染。AddCase 采用全量结构体绑定，客户端可自行注入 id（撞主键返回 500）、num（编号重复/为 0）、deleted=true（新建即不可见）、publicCase/latest 等字段，破坏编号与列表可见性契约。DeleteCase 忽略绑定错误：空 body 时 Where id = '' 命中 0 行，GORM 不报错，接口仍返回 200「删除成功」，前端据此把行从列表移除，刷新后数据又回来，形成「删除不生效」的幽灵状态。UpdateCase 同理，id 为空或不存在时静默返回 200「更新成功」。",
+      "impactScope": [
+        "handler.TestCaseHandler.AddCase",
+        "handler.TestCaseHandler.UpdateCase",
+        "handler.TestCaseHandler.DeleteCase",
+        "service.TestCaseService.UpdateCase",
+        "service.TestCaseService.DeleteCase",
+        "service/test_case.go:85",
+        "service/test_case.go:90",
+        "functional_case"
+      ],
+      "strategy": "造两条分别属于 orgA-project 与 orgB-project 的用例：(1) 带 PROJECT: orgA-project 调 /functional/case/update 修改 orgB 记录的 name，断言库中 orgB 行 name 不变；(2) /functional/case/delete 传空 body {}，断言 body.code != 200 且目标行 deleted 仍为 0；(3) /functional/case/add 传 \"deleted\":true 与自定义 num，断言落库 deleted=0 且 num 由服务端分配（或至少被忽略），并断言返回体 id 非客户端提供的伪造值。",
+      "verificationChecklist": [
+        "update/delete 的 SQL 必须同时含 id 与 project_id（或组织维度）约束，跨项目 id 不得命中",
+        "空 id 或不存在 id 的写请求必须返回非 200 业务码，且 RowsAffected=0 时不得返回成功文案",
+        "add 接口必须忽略客户端传入的 id/deleted/createUser/createdAt，num 由服务端按项目递增",
+        "每次写操作后必须能在库中观察到 deleted/delete_time/delete_user 的精确变化，且审计日志的 project 与记录归属一致"
+      ],
+      "cases": [
+        {
+          "id": "tc-case-crud-01",
+          "name": "test_update_case_cross_project_must_not_modify",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_crud_scope_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupCaseCrudTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.FunctionalCase{}); err != nil {\n\t\tt.Fatalf(\"automigrate functional_case: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestUpdateCase_CrossProject_MustNotModify(t *testing.T) {\n\tdb := setupCaseCrudTestDB(t)\n\tif err := db.Exec(\"DELETE FROM functional_case WHERE id = ?\", \"case-foreign-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.FunctionalCase{\n\t\tID:        \"case-foreign-1\",\n\t\tProjectID: \"orgB-project\",\n\t\tName:      \"B项目用例\",\n\t\tDeleted:   model.BitBool(false),\n\t\tCreatedAt: 1,\n\t\tUpdatedAt: 1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/functional/case/update\", NewTestCaseHandler().UpdateCase)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/functional/case/update\", bytes.NewReader([]byte(`{\"id\":\"case-foreign-1\",\"name\":\"被越权改名\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\treq.Header.Set(\"PROJECT\", \"orgA-project\")\n\tr.ServeHTTP(w, req)\n\n\tvar row model.FunctionalCase\n\tif err := db.Where(\"id = ?\", \"case-foreign-1\").First(&row).Error; err != nil {\n\t\tt.Fatalf(\"reload: %v\", err)\n\t}\n\tif row.Name != \"B项目用例\" {\n\t\tt.Errorf(\"越权写入: name=%q, want %q (UpdateCase 的 Where 只有 id, 未校验 project_id)\", row.Name, \"B项目用例\")\n\t}\n\tif row.ProjectID != \"orgB-project\" {\n\t\tt.Errorf(\"记录归属被改写: projectId=%q, want orgB-project\", row.ProjectID)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "orgB-project 记录的 name 仍为 \"B项目用例\"、projectId 仍为 \"orgB-project\"；HTTP 响应 code != 200 或至少 RowsAffected == 0",
+            "dbStateDiff": "期望 UPDATE functional_case ... WHERE id=? AND project_id=? 命中 0 行；functional_case.update_user/updated_at 不得变化",
+            "traceLog": "期望 body.code 为非 200 业务码（建议 403/404），日志含 PROJECT=orgA-project 与目标记录 project_id=orgB-project 的审计告警"
+          }
+        },
+        {
+          "id": "tc-case-crud-02",
+          "name": "test_delete_case_empty_body_must_not_report_success",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_delete_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupCaseDeleteTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.FunctionalCase{}); err != nil {\n\t\tt.Fatalf(\"automigrate functional_case: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestDeleteCase_EmptyBody_MustNotReportSuccess(t *testing.T) {\n\tdb := setupCaseDeleteTestDB(t)\n\tif err := db.Exec(\"DELETE FROM functional_case WHERE id = ?\", \"case-keep-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.FunctionalCase{\n\t\tID:        \"case-keep-1\",\n\t\tProjectID: \"p1\",\n\t\tName:      \"不应被删\",\n\t\tDeleted:   model.BitBool(false),\n\t\tCreatedAt: 1,\n\t\tUpdatedAt: 1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/functional/case/delete\", NewTestCaseHandler().DeleteCase)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/functional/case/delete\", bytes.NewReader([]byte(`{}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode    int    `json:\"code\"`\n\t\tMessage string `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif envelope.Code == 200 {\n\t\tt.Errorf(\"空 body 删除被当成成功: code=200 message=%s (ShouldBindJSON 错误被 _ = 忽略, body.ID 为空串)\", envelope.Message)\n\t}\n\n\tvar row model.FunctionalCase\n\tif err := db.Where(\"id = ?\", \"case-keep-1\").First(&row).Error; err != nil {\n\t\tt.Fatalf(\"reload: %v\", err)\n\t}\n\tif bool(row.Deleted) {\n\t\tt.Errorf(\"deleted 被误置为 1, want 0\")\n\t}\n}\n",
+          "evidence": {
+            "assertion": "body.code != 200（应为 400 参数错误）；DB 中 case-keep-1 的 deleted == 0、delete_time 为 NULL",
+            "dbStateDiff": "期望 UPDATE 影响 0 行（或直接被参数校验拦截），functional_case 无任何字段变化",
+            "traceLog": "期望日志出现参数校验失败，且不得出现 message=删除成功 的成功审计记录"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无任何写路径的越权/幂等测试；鉴权中间件不阻断匿名请求，导致「无凭证 = admin」从未被验证。",
+        "onlineMonitoring": "对 /functional/case/{add,update,delete} 记录 (authHeaderPresent, PROJECT header, 影响行数)，RowsAffected=0 却返回 code=200 时立刻告警；对同一 id 短时间多次 delete 做重复率统计。"
+      }
+    }
+  },
+  {
+    "id": "sec-case-module-tree",
+    "sectionNumber": "4.4",
+    "lineStart": 97,
+    "lineEnd": 142,
+    "title": "用例模块树构建（GetModuleTree：nil 根切片、children omitempty 与悬空父节点提升）",
+    "paragraphs": [
+      "GetModuleTree(projectId) 用 Where(\"project_id = ?\").Order(\"pos ASC, created_at ASC\").Find(&modules) 取全部模块（该表无 deleted 列，删除是物理删除），再按 module_id 分组统计 deleted = 0 的用例数填充 CaseCount（service/test_case.go:97-119）。",
+      "构建时对每个模块设置 mod.Children = make([]*model.FunctionalCaseModule, 0)，但根集合声明为 var rootNodes []*model.FunctionalCaseModule；FunctionalCaseModule.Children 的 json tag 是 children,omitempty，CaseCount 为 gorm:\"-\"（model/test_case.go:46-47，service/test_case.go:122-141）。",
+      "父节点判定接受 ParentID 为空串、\"NONE\"、\"root\"；若 ParentID 在结果集中找不到对应模块，该节点被直接追加进 rootNodes（service/test_case.go:131-139）。",
+      "任何 project_id 都能查询：projectId 依次取 c.Query(\"projectId\")、c.GetHeader(\"PROJECT\")，路径变量版本取 c.Param(\"projectId\")，均无归属校验（handler/test_case.go:122-134、246-257）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-case-module-tree",
+      "title": "空模块树返回 null 且叶子节点缺失 children 数组，前端树组件直接崩溃",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/边界",
+      "riskDescription": "当项目下没有任何模块（新建项目、错误 projectId、或 projectId 为空串导致 WHERE project_id = '' 命中 0 行）时，rootNodes 为 nil，data 序列化为 null；前端模块树组件对 data.map 调用抛 TypeError，用例管理页左侧树完全无法渲染。当某模块没有子节点时，Children 为空切片，omitempty 会把 children 键整体省略，前端 node.children.map(...) 读到 undefined 再次崩溃——即 make([]*..., 0) 的「防空」在 response 层被 omitempty 抵消，两个措施互相矛盾。此外父节点缺失的子模块被静默提升为根节点，前端看到的层级与实际 parent_id 不符；且任何凭证可传任意 projectId 读取他项目的模块结构（含用例计数），构成跨项目信息泄漏。",
+      "impactScope": [
+        "service.TestCaseService.GetModuleTree",
+        "model.FunctionalCaseModule.Children",
+        "model/test_case.go:46",
+        "service/test_case.go:127",
+        "service/test_case.go:137",
+        "functional_case_module",
+        "functional_case"
+      ],
+      "strategy": "httptest 挂载 GET /functional/case/module/tree：(1) 清空 p-tree 模块后请求 projectId=p-tree，断言 data 字面量为 []（非 null）；(2) 造一个 ParentID=NONE 的叶子模块，断言返回节点存在 children 键且字面量为 []；(3) 造 A→B→C 三层，直接物理删除 B（模拟删除模块后的悬空状态），断言 C 不得出现在 root 层（当前实现会提升为根）。",
+      "verificationChecklist": [
+        "无模块项目的 data 必须为 []，叶子节点的 children 必须显式为 []（json tag 需去掉 omitempty 或统一写 null→[]）",
+        "ParentID 在结果集中不存在时不得静默提升为根节点，应记日志或返回 500/明确降级标记",
+        "caseCount 必须只统计 deleted = 0 的用例，且与 /functional/case/module/count 的同一 module 计数一致",
+        "模块树查询必须带 project_id 归属校验，跨项目 projectId 不得回显模块名与用例数"
+      ],
+      "cases": [
+        {
+          "id": "tc-case-module-tree-01",
+          "name": "test_get_module_tree_empty_and_leaf_children_must_be_arrays",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_module_tree_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupModuleTreeTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.FunctionalCaseModule{}, &model.FunctionalCase{}); err != nil {\n\t\tt.Fatalf(\"automigrate: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestGetModuleTree_EmptyAndLeafChildren_MustBeArrays(t *testing.T) {\n\tdb := setupModuleTreeTestDB(t)\n\tif err := db.Exec(\"DELETE FROM functional_case_module WHERE project_id = ?\", \"p-tree\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tleaf := model.FunctionalCaseModule{ID: \"mod-leaf\", ProjectID: \"p-tree\", Name: \"叶子模块\", ParentID: \"NONE\", CreatedAt: 1, UpdatedAt: 1}\n\tif err := db.Create(&leaf).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.GET(\"/functional/case/module/tree\", NewTestCaseHandler().GetModuleTree)\n\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/functional/case/module/tree?projectId=p-tree\", nil))\n\n\tvar envelope struct {\n\t\tCode int             `json:\"code\"`\n\t\tData json.RawMessage `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif envelope.Code != 200 {\n\t\tt.Fatalf(\"code=%d, want 200\", envelope.Code)\n\t}\n\tif got := string(bytes.TrimSpace(envelope.Data)); got == \"null\" {\n\t\tt.Fatalf(\"data=null, want [] (var rootNodes []*model.FunctionalCaseModule 为 nil)\")\n\t}\n\n\tvar nodes []map[string]json.RawMessage\n\tif err := json.Unmarshal(envelope.Data, &nodes); err != nil {\n\t\tt.Fatalf(\"data 不是数组: %v data=%s\", err, string(envelope.Data))\n\t}\n\tif len(nodes) != 1 {\n\t\tt.Fatalf(\"root 节点数=%d, want 1\", len(nodes))\n\t}\n\tchildren, ok := nodes[0][\"children\"]\n\tif !ok {\n\t\tt.Errorf(\"叶子模块缺少 children 键: tag 为 children,omitempty, 空切片被整体省略导致前端 node.children.map 崩溃\")\n\t} else if string(bytes.TrimSpace(children)) != \"[]\" {\n\t\tt.Errorf(\"children=%s, want []\", string(bytes.TrimSpace(children)))\n\t}\n\n\tw2 := httptest.NewRecorder()\n\tr.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/functional/case/module/tree?projectId=p-no-module\", nil))\n\tif !bytes.Contains(w2.Body.Bytes(), []byte(`\"data\":[]`)) {\n\t\tt.Errorf(\"空项目模块树必须为 []: body=%s\", w2.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "code == 200；单叶子模块响应的 data[0] 必须含 children 键且值为 []；无模块项目 data 字面量 == []",
+            "dbStateDiff": "[READ-ONLY] 仅 SELECT functional_case_module / functional_case，测试前后行数一致",
+            "traceLog": "期望 HTTP 200、P99 < 30ms；若 data=null 需记录前端白屏工单关联"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无树形结构序列化测试，omitempty 与 nil 切片的组合行为从未被验证。",
+        "onlineMonitoring": "对 /functional/case/module/tree 响应断言 data 非 null 并使 module tree 渲染失败的前端错误上报（树组件 throw）进入同一告警看板。"
+      }
+    }
+  },
+  {
+    "id": "sec-case-module-crud",
+    "sectionNumber": "4.5",
+    "lineStart": 184,
+    "lineEnd": 197,
+    "title": "用例模块增改删（AddModule/UpdateModule/DeleteModule：仅删一层的物理删除与孤儿提升）",
+    "paragraphs": [
+      "AddModule 绑定 model.FunctionalCaseModule，ParentID 为空时置为 \"NONE\"，ID 为空时用 uuid.New().String() 生成，CreateUser/UpdateUser/CreatedAt/UpdatedAt 由服务端补齐（service/test_case.go:144-157）。",
+      "UpdateModule 走 Updates(m) 结构体更新，Where 只有 id，因此 Pos=0、ParentID 空串等零值字段无法通过更新写回，也无法把模块移动为根（service/test_case.go:159-164）。",
+      "DeleteModule 执行 config.DB.Where(\"id = ? OR parent_id = ?\", id, id).Delete(&model.FunctionalCaseModule{})：FunctionalCaseModule 没有 Deleted 字段也没有 gorm.DeletedAt，GORM 生成物理 DELETE，且只删自身与直接子节点，孙节点残留（service/test_case.go:166-168）。",
+      "删除模块不会处理 functional_case.module_id 引用，也不会级联清理；被删模块下的用例仍然存在且 module_id 指向不存在的模块（handler/test_case.go:184-197 只写审计日志）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-case-module-crud",
+      "title": "模块物理删除不可恢复、仅删一层造成孤儿与用例悬空引用",
+      "riskLevel": "P0",
+      "riskTag": "数据污染/状态机",
+      "riskDescription": "删除一个中间层模块时，SQL 只覆盖 id 与 parent_id 两层，第三层及更深的孙模块 parent_id 指向已删除记录而继续留在表中：调用模块树接口时这些孤儿会被 service/test_case.go:136-138 的 else 分支静默提升为根节点，前端看到凭空出现的顶层模块；同时其下的用例仍挂在被删模块 module_id 上，用例数与模块树的 caseCount 永久对不上。删除是物理 DELETE，无 deleted/delete_time 字段（model/test_case.go:36-48），误删后无法回滚、也无法审计「谁删了什么内容」，只有一条不含数据的操作日志。任何携带其他项目 projectId 的请求同样可以删除他项目的模块（Where 中不含 project_id），构成跨项目数据破坏。",
+      "impactScope": [
+        "service.TestCaseService.DeleteModule",
+        "service.TestCaseService.AddModule",
+        "service.TestCaseService.UpdateModule",
+        "service/test_case.go:167",
+        "handler/test_case.go:190",
+        "functional_case_module",
+        "functional_case.module_id"
+      ],
+      "strategy": "造 A→B→C 三层模块与 3 条挂在 B 下的用例：(1) POST /functional/case/module/delete {id: mod-b} 后断言 functional_case_module 中不存在 parent_id = mod-b 的任何层级残留，且树接口不再出现 mod-c；(2) 断言该模块下的 functional_case 记录没有被留下悬空 module_id（要么被拒绝删除返回非 200，要么用例被重新挂载），并用 SQL 校验 SELECT COUNT(*) FROM functional_case_module m LEFT JOIN functional_case_module p ON m.parent_id = p.id WHERE m.parent_id NOT IN ('NONE','root','') AND p.id IS NULL 为 0。",
+      "verificationChecklist": [
+        "删除父模块必须递归覆盖全部后代层级（LEFT JOIN 自检不得有 parent_id 悬空的行）",
+        "存在用例引用的模块必须拒绝删除或先迁移用例，不得留下 module_id 指向不存在模块的 functional_case",
+        "模块删除需为软删（deleted/delete_time/delete_user）或提供可回滚路径，审计日志必须记录被删模块 ID 与名称",
+        "DeleteModule 的 Where 必须带 project_id 归属约束"
+      ],
+      "cases": [
+        {
+          "id": "tc-module-delete-01",
+          "name": "test_delete_module_three_level_must_not_leave_orphan",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_module_delete_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupModuleDeleteTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.FunctionalCaseModule{}, &model.FunctionalCase{}); err != nil {\n\t\tt.Fatalf(\"automigrate: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestDeleteModule_ThreeLevel_MustNotLeaveOrphan(t *testing.T) {\n\tdb := setupModuleDeleteTestDB(t)\n\tif err := db.Exec(\"DELETE FROM functional_case_module WHERE project_id = ?\", \"p-del\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tmods := []model.FunctionalCaseModule{\n\t\t{ID: \"mod-a\", ProjectID: \"p-del\", Name: \"A\", ParentID: \"NONE\", CreatedAt: 1, UpdatedAt: 1},\n\t\t{ID: \"mod-b\", ProjectID: \"p-del\", Name: \"B\", ParentID: \"mod-a\", CreatedAt: 2, UpdatedAt: 2},\n\t\t{ID: \"mod-c\", ProjectID: \"p-del\", Name: \"C\", ParentID: \"mod-b\", CreatedAt: 3, UpdatedAt: 3},\n\t}\n\tfor i := range mods {\n\t\tif err := db.Create(&mods[i]).Error; err != nil {\n\t\t\tt.Fatalf(\"seed %s: %v\", mods[i].ID, err)\n\t\t}\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/functional/case/module/delete\", NewTestCaseHandler().DeleteModule)\n\tr.GET(\"/functional/case/module/tree\", NewTestCaseHandler().GetModuleTree)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/functional/case/module/delete\", bytes.NewReader([]byte(`{\"id\":\"mod-b\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar orphan int64\n\tif err := db.Model(&model.FunctionalCaseModule{}).Where(\"id = ?\", \"mod-c\").Count(&orphan).Error; err != nil {\n\t\tt.Fatalf(\"count mod-c: %v\", err)\n\t}\n\tif orphan != 0 {\n\t\tt.Errorf(\"删除 mod-b 后 mod-c 仍存在 %d 行: Where(id = ? OR parent_id = ?) 只删一层, 孙节点 parent_id 悬空\", orphan)\n\t}\n\n\tvar dangling int64\n\tif err := db.Raw(\"SELECT COUNT(*) FROM functional_case_module m LEFT JOIN functional_case_module p ON m.parent_id = p.id WHERE m.parent_id NOT IN ('NONE','root','') AND p.id IS NULL\").Scan(&dangling).Error; err != nil {\n\t\tt.Fatalf(\"dangling query: %v\", err)\n\t}\n\tif dangling != 0 {\n\t\tt.Errorf(\"存在 %d 个 parent_id 悬空的孤儿模块, want 0\", dangling)\n\t}\n\n\tw2 := httptest.NewRecorder()\n\tr.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/functional/case/module/tree?projectId=p-del\", nil))\n\tif bytes.Contains(w2.Body.Bytes(), []byte(\"mod-c\")) {\n\t\tt.Errorf(\"孤儿模块 mod-c 被提升为根节点出现在模块树: body=%s\", w2.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "删除 mod-b 后 SELECT COUNT(*) FROM functional_case_module WHERE id='mod-c' == 0；自连接悬空计数 == 0；模块树响应不含 mod-c",
+            "dbStateDiff": "期望 DELETE FROM functional_case_module WHERE id='mod-b' OR parent_id IN (递归后代)（或 UPDATE deleted=1），functional_case_module 行数减少 2（mod-b 与 mod-c）",
+            "traceLog": "期望 HTTP 200、body.code=200、message=删除成功；审计日志 PROJECT 与模块归属项目一致"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无模块层级与级联删除测试，仓库也不存在 functional_case_module 的软删字段迁移。",
+        "onlineMonitoring": "定时任务校验 functional_case_module 自连接悬空数、functional_case.module_id 无效引用的行数，>0 立即告警；对 /functional/case/module/delete 记录被删模块的子树规模。"
+      }
+    }
+  },
+  {
+    "id": "sec-module-count-and-stubs",
+    "sectionNumber": "4.6",
+    "lineStart": 199,
+    "lineEnd": 244,
+    "title": "模块用例计数与自定义字段占位接口（ModuleCount 实算、TrashModuleCount 硬编码与 CustomField 空数组桩）",
+    "paragraphs": [
+      "ModuleCount 直接使用 config.DB 分组统计：Select(\"module_id, count(*) as count\") + Where(\"project_id = ? AND deleted = 0\") + Group(\"module_id\")，再单独 Count 出总数，返回 make(map[string]int64) 并把 all 置为总数；projectId 依次取 body.projectId 与 c.GetHeader(\"PROJECT\")，两者都为空时执行 WHERE project_id = '' 并返回 {\"all\":0}，不报参数错误（handler/test_case.go:207-237）。",
+      "TrashModuleCount 完全忽略请求，固定 response.Success(c, gin.H{\"all\": 0})，既不读 projectId 也不查询 deleted = 1 的用例（handler/test_case.go:240-244，router.go:111）。",
+      "CustomField（POST /functional/case/custom/field）与 DefaultTemplateField（GET /functional/case/default/template/field[/:projectId]）都只有一行 response.Success(c, []interface{}{})，不读 projectId/templateId、不查任何表；因为是 []interface{}{} 字面量而非 var x []T，data 稳定为 [] 不会 null（handler/test_case.go:199-205，router.go:107-109）。",
+      "BugHandler 的 CustomFieldHeader/TemplateOption/ColumnsOption/FeishuOptions 采用完全相同的占位实现，说明这是全项目统一的 emulator 策略（handler/bug.go:114-128）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-module-count-and-stubs",
+      "title": "回收站计数恒为 0 且用例自定义字段能力整体缺失，前端静默降级",
+      "riskLevel": "P2",
+      "riskTag": "契约破坏/功能桩",
+      "riskDescription": "TrashModuleCount 始终返回 {all:0}：回收站入口的用例数徽标永远为 0，用户看到「回收站为空」但库中 deleted=1 的用例实际存在（DeleteCase 确实写了 deleted=1），也无法按模块展示回收站分布；它与 ModuleCount 共用同一响应形状，调用方无法从响应区分「真桩」与「确实没有数据」。CustomField/DefaultTemplateField 恒返回 []，前端用例编辑器的自定义字段列、默认值、必填校验全部缺席，接口却返回 code=200 message=success，属于静默降级：测试人员会误判平台不支持该能力而非 emulator 未实现。ModuleCount 的 projectId 缺失时静默返回 {\"all\":0}，也会被前端当成「该项目确实没有用例」。",
+      "impactScope": [
+        "handler.TestCaseHandler.TrashModuleCount",
+        "handler.TestCaseHandler.ModuleCount",
+        "handler.TestCaseHandler.CustomField",
+        "handler.TestCaseHandler.DefaultTemplateField",
+        "handler/test_case.go:241",
+        "handler/bug.go:115",
+        "functional_case"
+      ],
+      "strategy": "造 2 条 deleted=1 与 1 条 deleted=0 的用例：(1) POST /functional/case/trash/module/count {projectId:p-trash} 断言 data.all == 2、data[\"mod-1\"] == 2（当前为硬编码 0）；(2) POST /functional/case/module/count 断言 data.all == 1 且 data[\"mod-1\"] == 1，并用 SQL 交叉核对；(3) 对 custom/field 与 default/template/field 断言 data 字面量为 []、code=200、message=success，固化占位契约并为未来接入真实数据留下回归护栏；同时断言 projectId 缺失时计数接口返回 400 而非静默 0。",
+      "verificationChecklist": [
+        "trash/module/count 必须统计 deleted = 1 且 project_id 匹配的行并按 module_id 分组，形状与 module/count 一致",
+        "module/count 必须带 deleted = 0 与 project_id 约束，all == 各 module 计数之和，projectId 缺失时返回参数错误",
+        "custom/field 与 default/template/field 的 data 必须字面量为 []（非 null），HTTP 200 且 code=200",
+        "桩接口在 projectId/templateId 缺失、超长或传非法 JSON 时不得 panic 或返回 500"
+      ],
+      "cases": [
+        {
+          "id": "tc-module-count-01",
+          "name": "test_trash_module_count_must_reflect_soft_deleted_rows",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_module_count_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupModuleCountTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.FunctionalCase{}); err != nil {\n\t\tt.Fatalf(\"automigrate functional_case: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestTrashModuleCount_MustReflectSoftDeletedRows(t *testing.T) {\n\tdb := setupModuleCountTestDB(t)\n\tif err := db.Exec(\"DELETE FROM functional_case WHERE project_id = ?\", \"p-trash\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\trows := []model.FunctionalCase{\n\t\t{ID: \"trash-1\", ProjectID: \"p-trash\", ModuleID: \"mod-1\", Name: \"回收站用例1\", Deleted: model.BitBool(true), CreatedAt: 1, UpdatedAt: 1},\n\t\t{ID: \"trash-2\", ProjectID: \"p-trash\", ModuleID: \"mod-1\", Name: \"回收站用例2\", Deleted: model.BitBool(true), CreatedAt: 2, UpdatedAt: 2},\n\t\t{ID: \"alive-1\", ProjectID: \"p-trash\", ModuleID: \"mod-1\", Name: \"正常用例\", Deleted: model.BitBool(false), CreatedAt: 3, UpdatedAt: 3},\n\t}\n\tfor i := range rows {\n\t\tif err := db.Create(&rows[i]).Error; err != nil {\n\t\t\tt.Fatalf(\"seed %s: %v\", rows[i].ID, err)\n\t\t}\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/functional/case/trash/module/count\", NewTestCaseHandler().TrashModuleCount)\n\tr.POST(\"/functional/case/module/count\", NewTestCaseHandler().ModuleCount)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/functional/case/trash/module/count\", bytes.NewReader([]byte(`{\"projectId\":\"p-trash\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode int              `json:\"code\"`\n\t\tData map[string]int64 `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif envelope.Data[\"all\"] != 2 {\n\t\tt.Errorf(\"回收站用例数=%d, want 2 (TrashModuleCount 固定 gin.H{all: 0}, 未查询 deleted = 1)\", envelope.Data[\"all\"])\n\t}\n\tif envelope.Data[\"mod-1\"] != 2 {\n\t\tt.Errorf(\"回收站模块 mod-1 计数=%d, want 2\", envelope.Data[\"mod-1\"])\n\t}\n\n\tw2 := httptest.NewRecorder()\n\treq2 := httptest.NewRequest(http.MethodPost, \"/functional/case/module/count\", bytes.NewReader([]byte(`{\"projectId\":\"p-trash\"}`)))\n\treq2.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w2, req2)\n\n\tvar envelope2 struct {\n\t\tCode int              `json:\"code\"`\n\t\tData map[string]int64 `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w2.Body.Bytes(), &envelope2); err != nil {\n\t\tt.Fatalf(\"envelope2 unmarshal: %v body=%s\", err, w2.Body.String())\n\t}\n\tif envelope2.Data[\"all\"] != 1 || envelope2.Data[\"mod-1\"] != 1 {\n\t\tt.Errorf(\"在用用例计数 all=%d mod-1=%d, want 1/1 (必须带 deleted = 0)\", envelope2.Data[\"all\"], envelope2.Data[\"mod-1\"])\n\t}\n}\n",
+          "evidence": {
+            "assertion": "trash/module/count 的 data.all == 2 且 data[\"mod-1\"] == 2；module/count 的 data.all == 1 且 data[\"mod-1\"] == 1",
+            "dbStateDiff": "[READ-ONLY] 仅 GROUP BY 聚合 SELECT，functional_case 行与 deleted 标志不变",
+            "traceLog": "期望 HTTP 200、body.code=200、message=success；两条 SQL 均在毫秒级完成"
+          }
+        },
+        {
+          "id": "tc-custom-field-01",
+          "name": "test_custom_field_stub_must_return_empty_array_envelope",
+          "lang": "go",
+          "filePath": "internal/handler/test_case_custom_field_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\nfunc TestCustomField_StubMustReturnEmptyArrayEnvelope(t *testing.T) {\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/functional/case/custom/field\", NewTestCaseHandler().CustomField)\n\tr.GET(\"/functional/case/default/template/field/:projectId\", NewTestCaseHandler().DefaultTemplateField)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/functional/case/custom/field\", bytes.NewReader([]byte(`{\"projectId\":\"p1\",\"templateId\":\"t1\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode    int             `json:\"code\"`\n\t\tData    json.RawMessage `json:\"data\"`\n\t\tMessage string          `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif w.Code != http.StatusOK || envelope.Code != 200 || envelope.Message != \"success\" {\n\t\tt.Fatalf(\"信封不符: http=%d code=%d message=%s, want 200/200/success\", w.Code, envelope.Code, envelope.Message)\n\t}\n\tif got := string(bytes.TrimSpace(envelope.Data)); got != \"[]\" {\n\t\tt.Errorf(\"data=%s, want [] (占位桩实现为 response.Success(c, []interface{}{}))\", got)\n\t}\n\n\tw2 := httptest.NewRecorder()\n\tr.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/functional/case/default/template/field/p1\", nil))\n\tvar envelope2 struct {\n\t\tCode int             `json:\"code\"`\n\t\tData json.RawMessage `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w2.Body.Bytes(), &envelope2); err != nil {\n\t\tt.Fatalf(\"envelope2 unmarshal: %v body=%s\", err, w2.Body.String())\n\t}\n\tif envelope2.Code != 200 || string(bytes.TrimSpace(envelope2.Data)) != \"[]\" {\n\t\tt.Errorf(\"默认模板字段接口 code=%d data=%s, want 200/[]\", envelope2.Code, string(bytes.TrimSpace(envelope2.Data)))\n\t}\n}\n",
+          "evidence": {
+            "assertion": "两个接口均 HTTP 200、body.code == 200、message == \"success\"、data 字面量 == \"[]\"",
+            "dbStateDiff": "[READ-ONLY] 桩实现不触达数据库，无任何 SQL 写入",
+            "traceLog": "期望 P99 < 5ms（纯内存响应），日志无 SQL 慢查询"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无计数接口与占位接口的测试；回收站与自定义字段均为显式占位实现，既无测试也无 TODO 标记，契约完整度从未被度量。",
+        "onlineMonitoring": "对比 trash/module/count 的 all 与 SELECT COUNT(*) FROM functional_case WHERE deleted=1 AND project_id=? 的差异，长期为 0 而库中有软删数据时触发桩实现告警；对 custom/field 响应做 schema 抽样，data 非数组时告警。"
+      }
+    }
+  },
+  {
+    "id": "sec-bug-page",
+    "sectionNumber": "5.1",
+    "lineStart": 20,
+    "lineEnd": 33,
+    "title": "缺陷分页查询（GetBugPage：nil 列表、过滤条件与分页元数据）",
+    "paragraphs": [
+      "POST /bug/page 绑定 service.BugPageParams（projectId/statuses/keyword/current/pageSize），projectId 为空回落 c.GetHeader(\"PROJECT\")，绑定错误被 _ = 丢弃（handler/bug.go:20-26，router.go:114）。",
+      "service.GetBugPage 同样以值传递接收 params，内部兜底 Current=1/PageSize=10，查询条件 deleted = 0 + 可选 project_id + status IN (...) + title LIKE %kw%（service/bug.go:25-49），但 handler 第 32 行回传给 response.SuccessPage 的仍是未兜底的 0 值。",
+      "列表声明为 var list []model.Bug，Find 无命中时为 nil，data.list 序列化为 null；排序只有 Order(\"created_at DESC\")，created_at 为毫秒时间戳，同毫秒写入的多条记录顺序不稳定（service/bug.go:33-49）。",
+      "count 与 Find 复用同一 *gorm.DB 且无事务，total 与当页数据可能来自不同快照。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-bug-page",
+      "title": "缺陷空列表 null 化与排序不稳定，前端缺陷列表崩溃或翻页丢数据",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/分页一致性",
+      "riskDescription": "缺陷列表空结果时 data.list 为 null，前端 table.map 抛 TypeError，缺陷管理页白屏。排序仅按 created_at DESC（毫秒精度），批量导入或同毫秒创建的缺陷在 LIMIT/OFFSET 分页下顺序不稳定，翻页时同一缺陷可能在两页重复出现、另一些缺陷永远看不到，且 total 与实际去重后可遍历的行数不一致。current/pageSize 未传时因 response.PageResult 的 omitempty 而从响应中消失，前端分页器读不到页码元数据。过滤条件也被裁剪：仅支持 statuses/keyword，前端其余筛选（处理人、模块、缺陷类型等）在服务端无效，用户以为已过滤实则拿到全量数据。",
+      "impactScope": [
+        "handler.BugHandler.GetBugPage",
+        "service.BugService.GetBugPage",
+        "handler/bug.go:32",
+        "service/bug.go:33",
+        "service/bug.go:49",
+        "bug"
+      ],
+      "strategy": "造 3 条缺陷（NEW 未删、CLOSED 未删、NEW 已删）与一个空项目：(1) 带 statuses=[NEW] + keyword 查询，断言 total == 1 且 list 只含未删的 NEW 记录；(2) 空项目查询断言响应体含 \"list\":[]；(3) 插入 5 条 created_at 完全相同的缺陷，按 pageSize=2 逐页取完，断言收集到的 id 集合无重复且与库中集合相等（暴露 ORDER BY created_at DESC 的不稳定性）。",
+      "verificationChecklist": [
+        "空结果 data.list 必须为 []（非 null），data.total == 0、data.totalPages == 0",
+        "statuses/keyword/projectId 过滤必须同时生效，且都叠加 deleted = 0",
+        "排序必须追加唯一键（如 id）作为 tie-breaker，逐页遍历不得出现重复或遗漏",
+        "未传分页参数时必须回显 current=1、pageSize=10，totalPages 按实际 pageSize 计算"
+      ],
+      "cases": [
+        {
+          "id": "tc-bug-page-01",
+          "name": "test_get_bug_page_filters_and_empty_list_contract",
+          "lang": "go",
+          "filePath": "internal/handler/bug_page_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupBugPageTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Bug{}); err != nil {\n\t\tt.Fatalf(\"automigrate bug: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestGetBugPage_FiltersAndEmptyListContract(t *testing.T) {\n\tdb := setupBugPageTestDB(t)\n\tif err := db.Exec(\"DELETE FROM bug WHERE project_id = ?\", \"p-bug\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\trows := []model.Bug{\n\t\t{ID: \"bug-new-1\", ProjectID: \"p-bug\", Title: \"登录失败\", Status: \"NEW\", Deleted: model.BitBool(false), CreatedAt: 10, UpdatedAt: 10},\n\t\t{ID: \"bug-closed-1\", ProjectID: \"p-bug\", Title: \"登录失败已关闭\", Status: \"CLOSED\", Deleted: model.BitBool(false), CreatedAt: 11, UpdatedAt: 11},\n\t\t{ID: \"bug-deleted-1\", ProjectID: \"p-bug\", Title: \"登录失败已删除\", Status: \"NEW\", Deleted: model.BitBool(true), CreatedAt: 12, UpdatedAt: 12},\n\t}\n\tfor i := range rows {\n\t\tif err := db.Create(&rows[i]).Error; err != nil {\n\t\t\tt.Fatalf(\"seed %s: %v\", rows[i].ID, err)\n\t\t}\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/bug/page\", NewBugHandler().GetBugPage)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/bug/page\", bytes.NewReader([]byte(`{\"projectId\":\"p-bug\",\"statuses\":[\"NEW\"],\"keyword\":\"登录\",\"current\":1,\"pageSize\":10}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode int             `json:\"code\"`\n\t\tData json.RawMessage `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif envelope.Code != 200 {\n\t\tt.Fatalf(\"code=%d, want 200\", envelope.Code)\n\t}\n\n\tvar page struct {\n\t\tList       []model.Bug `json:\"list\"`\n\t\tTotal      int64       `json:\"total\"`\n\t\tTotalPages int64       `json:\"totalPages\"`\n\t}\n\tif err := json.Unmarshal(envelope.Data, &page); err != nil {\n\t\tt.Fatalf(\"page unmarshal: %v data=%s\", err, string(envelope.Data))\n\t}\n\tif page.Total != 1 || len(page.List) != 1 || page.List[0].ID != \"bug-new-1\" {\n\t\tt.Errorf(\"过滤结果错误: total=%d len(list)=%d list=%+v, want 1/1 且仅 bug-new-1\", page.Total, len(page.List), page.List)\n\t}\n\tif page.TotalPages != 1 {\n\t\tt.Errorf(\"totalPages=%d, want 1\", page.TotalPages)\n\t}\n\n\tw2 := httptest.NewRecorder()\n\treq2 := httptest.NewRequest(http.MethodPost, \"/bug/page\", bytes.NewReader([]byte(`{\"projectId\":\"p-bug-empty\",\"current\":1,\"pageSize\":10}`)))\n\treq2.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w2, req2)\n\tif !bytes.Contains(w2.Body.Bytes(), []byte(`\"list\":[]`)) {\n\t\tt.Errorf(\"空结果 data.list 必须为 []: body=%s (var list []model.Bug 为 nil 时序列化为 null)\", w2.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "statuses=[NEW]+keyword=登录+projectId=p-bug → total == 1、len(list) == 1、list[0].ID == \"bug-new-1\"、totalPages == 1；空项目响应体包含 \"list\":[]",
+            "dbStateDiff": "[READ-ONLY] 仅 COUNT/SELECT bug 表，测试前后 deleted 与行数不变",
+            "traceLog": "期望 HTTP 200、body.code=200；SQL 日志应含 status IN ('NEW') AND title LIKE '%登录%' AND deleted = 0 AND project_id = 'p-bug'"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无缺陷分页测试，排序稳定性与 null 列表问题缺少回归护栏。",
+        "onlineMonitoring": "统计 /bug/page 的 total 与前端去重后行数差异；前端 table 渲染异常（Cannot read properties of null）错误率接入告警。"
+      }
+    }
+  },
+  {
+    "id": "sec-bug-lifecycle",
+    "sectionNumber": "5.2",
+    "lineStart": 45,
+    "lineEnd": 108,
+    "title": "缺陷生命周期（AddBug/UpdateBug/DeleteBug：状态机缺失、零行静默成功与跨项目删除）",
+    "paragraphs": [
+      "AddBug 绑定 model.Bug 全量结构体后仅补 ID/CreateUser/UpdateUser/CreatedAt/UpdatedAt，并把空 Platform 置为 \"LOCAL\"、空 Status 置为 \"NEW\"，status 取值不做白名单校验（service/bug.go:63-79）。",
+      "UpdateBug 用 Model(&model.Bug{}).Where(\"id = ?\", b.ID).Updates(b) 结构体更新：GORM 跳过零值字段（如 ReopenCount=0、Pos=0、空 HandleUser），且 Where 中既无 project_id 也无 deleted = 0；命中 0 行时不返回错误（service/bug.go:81-86）。",
+      "DeleteBug 用 Updates(map) 写 deleted=1/delete_time/delete_user，Where 同样只有 id（service/bug.go:88-95）；路由同时暴露 GET 与 POST /bug/delete/:id，GET 也可能触发写操作（router.go:118-119）。",
+      "bug 表没有任何状态流转校验逻辑：ReopenCount 字段存在但服务端从不自增，前端可传任意字符串作为 status 直接落库（model/bug.go:16、model/bug.go:31）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-bug-lifecycle",
+      "title": "缺陷状态机缺失 + 零行更新假成功 + 跨项目越权删除",
+      "riskLevel": "P0",
+      "riskTag": "状态机/越权/幂等",
+      "riskDescription": "任何 status 字符串都能写入 bug 表：前端可以 POST status=\"XXX\" 得到一条状态未知的缺陷，列表筛选 statuses=[NEW] 后再也查不到它；CLOSED 直接跳回 NEW 时 reopenCount 恒为 0，管理报表中「重复打开率」永远为 0，负责人无法识别高频回归缺陷。UpdateBug 忽略 RowsAffected：body 缺 id 或 id 不存在时返回 code=200 message=更新成功，前端提示成功后刷新发现数据没变（幂等假象）。DeleteBug 的 Where 只含 id，携带 A 项目 PROJECT 头即可软删 B 项目缺陷，且通过 GET /bug/delete/:id 触发，浏览器预取、爬虫或链接扫描都可能造成非预期的数据删除。",
+      "impactScope": [
+        "handler.BugHandler.UpdateBug",
+        "handler.BugHandler.DeleteBug",
+        "service.BugService.AddBug",
+        "service.BugService.UpdateBug",
+        "service/bug.go:85",
+        "service/bug.go:90",
+        "bug.status",
+        "bug.reopen_count"
+      ],
+      "strategy": "以 bug 表为观察对象：(1) 造 CLOSED 缺陷，POST /bug/update {id,status:NEW} 断言 status 变为 NEW 且 reopen_count 自增为 1；(2) POST /bug/update 不带 id，断言 body.code != 200 且目标行 title 不变；(3) 造 project_id=orgB-project 的缺陷，带 PROJECT: orgA-project 调 GET /bug/delete/<id>，断言 deleted 仍为 0；(4) 额外注入 status=\"ILLEGAL\" 断言被拒绝（白名单校验）。",
+      "verificationChecklist": [
+        "status 必须受白名单约束，非法状态返回 400 且不入库；CLOSED→NEW 必须判定为 reopen 并自增 reopen_count",
+        "update/delete 的 WHERE 必须同时含 id 与 project_id，affected rows == 0 时必须返回 404 而非 200",
+        "删除必须只通过 DELETE/POST 语义明确的接口暴露，GET 不得产生写副作用，重复删除需返回明确的幂等结果",
+        "结构性零值（mock/pos/handleUser 清空）必须用 map 或 Select 更新，避免 GORM 跳过零值导致「改不动」"
+      ],
+      "cases": [
+        {
+          "id": "tc-bug-lifecycle-01",
+          "name": "test_update_bug_closed_to_new_must_increment_reopen_count",
+          "lang": "go",
+          "filePath": "internal/handler/bug_lifecycle_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupBugLifecycleTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Bug{}); err != nil {\n\t\tt.Fatalf(\"automigrate bug: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestUpdateBug_ClosedToNew_MustIncrementReopenCount(t *testing.T) {\n\tdb := setupBugLifecycleTestDB(t)\n\tif err := db.Exec(\"DELETE FROM bug WHERE id = ?\", \"bug-reopen-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.Bug{\n\t\tID:          \"bug-reopen-1\",\n\t\tProjectID:   \"p1\",\n\t\tTitle:       \"复现缺陷\",\n\t\tStatus:      \"CLOSED\",\n\t\tReopenCount: 0,\n\t\tDeleted:     model.BitBool(false),\n\t\tCreatedAt:   1,\n\t\tUpdatedAt:   1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/bug/update\", NewBugHandler().UpdateBug)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/bug/update\", bytes.NewReader([]byte(`{\"id\":\"bug-reopen-1\",\"status\":\"NEW\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar row model.Bug\n\tif err := db.Where(\"id = ?\", \"bug-reopen-1\").First(&row).Error; err != nil {\n\t\tt.Fatalf(\"reload: %v\", err)\n\t}\n\tif row.Status == \"NEW\" && row.ReopenCount != 1 {\n\t\tt.Errorf(\"CLOSED -> NEW 未记录重复打开: reopenCount=%d, want 1 (UpdateBug 直接 Updates(b), 没有状态机与 reopen_count 自增)\", row.ReopenCount)\n\t}\n\tif row.Status != \"CLOSED\" && row.Status != \"NEW\" {\n\t\tt.Errorf(\"非法状态写入: status=%q\", row.Status)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "更新后 bug.status == \"NEW\" 且 bug.reopen_count == 1；status 只能落在白名单集合内",
+            "dbStateDiff": "期望 UPDATE bug SET status='NEW', reopen_count = reopen_count + 1, updated_at=? WHERE id=? AND project_id=?",
+            "traceLog": "期望 HTTP 200、body.code=200；审计日志记录一次 UPDATE 且带状态流转前后值"
+          }
+        },
+        {
+          "id": "tc-bug-lifecycle-02",
+          "name": "test_update_bug_missing_id_must_reject_silent_success",
+          "lang": "go",
+          "filePath": "internal/handler/bug_update_noop_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupBugUpdateTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Bug{}); err != nil {\n\t\tt.Fatalf(\"automigrate bug: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestUpdateBug_MissingID_MustRejectSilentSuccess(t *testing.T) {\n\tdb := setupBugUpdateTestDB(t)\n\tif err := db.Exec(\"DELETE FROM bug WHERE id = ?\", \"bug-stable-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.Bug{\n\t\tID:        \"bug-stable-1\",\n\t\tProjectID: \"p1\",\n\t\tTitle:     \"原标题\",\n\t\tStatus:    \"NEW\",\n\t\tDeleted:   model.BitBool(false),\n\t\tCreatedAt: 1,\n\t\tUpdatedAt: 1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/bug/update\", NewBugHandler().UpdateBug)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/bug/update\", bytes.NewReader([]byte(`{\"title\":\"无 id 的更新\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode    int    `json:\"code\"`\n\t\tMessage string `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif envelope.Code == 200 {\n\t\tt.Errorf(\"缺 id 的更新被当成成功: code=200 message=%s (Where(id = ?) 命中 0 行时 GORM Updates 不返回错误)\", envelope.Message)\n\t}\n\n\tvar row model.Bug\n\tif err := db.Where(\"id = ?\", \"bug-stable-1\").First(&row).Error; err != nil {\n\t\tt.Fatalf(\"reload: %v\", err)\n\t}\n\tif row.Title != \"原标题\" {\n\t\tt.Errorf(\"标题被误改: title=%q, want 原标题\", row.Title)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "body.code != 200（应为 400 参数缺失或 404 记录不存在）；bug-stable-1.title 仍为 \"原标题\"",
+            "dbStateDiff": "期望 UPDATE bug ... WHERE id='' 不执行（参数校验前置），或影响 0 行并返回错误；updated_at/update_user 均不变",
+            "traceLog": "期望日志出现参数校验失败；不得出现 message=更新成功"
+          }
+        },
+        {
+          "id": "tc-bug-lifecycle-03",
+          "name": "test_delete_bug_cross_project_via_get_must_not_delete",
+          "lang": "go",
+          "filePath": "internal/handler/bug_delete_scope_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupBugDeleteTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Bug{}); err != nil {\n\t\tt.Fatalf(\"automigrate bug: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestDeleteBug_CrossProjectViaGet_MustNotDelete(t *testing.T) {\n\tdb := setupBugDeleteTestDB(t)\n\tif err := db.Exec(\"DELETE FROM bug WHERE id = ?\", \"bug-foreign-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.Bug{\n\t\tID:        \"bug-foreign-1\",\n\t\tProjectID: \"orgB-project\",\n\t\tTitle:     \"B项目缺陷\",\n\t\tStatus:    \"NEW\",\n\t\tDeleted:   model.BitBool(false),\n\t\tCreatedAt: 1,\n\t\tUpdatedAt: 1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.GET(\"/bug/delete/:id\", NewBugHandler().DeleteBug)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodGet, \"/bug/delete/bug-foreign-1\", nil)\n\treq.Header.Set(\"PROJECT\", \"orgA-project\")\n\tr.ServeHTTP(w, req)\n\n\tvar row model.Bug\n\tif err := db.Where(\"id = ?\", \"bug-foreign-1\").First(&row).Error; err != nil {\n\t\tt.Fatalf(\"reload: %v\", err)\n\t}\n\tif bool(row.Deleted) {\n\t\tt.Errorf(\"跨项目越权删除成功: deleted=1 (DeleteBug 的 Where 只有 id, 且 GET /bug/delete/:id 让预取即可触发写操作)\")\n\t}\n\tif row.DeleteTime != nil {\n\t\tt.Errorf(\"delete_time 被写入: %v, want NULL\", *row.DeleteTime)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "orgB-project 缺陷的 deleted == 0 且 delete_time == NULL；响应 code 为非 200 业务码（建议 403/404）",
+            "dbStateDiff": "期望 UPDATE bug SET deleted=1 ... WHERE id=? AND project_id=? 影响 0 行，bug 表无变化",
+            "traceLog": "期望审计日志不记录删除成功；若出现 GET /bug/delete 触发写操作需记录安全告警"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "缺陷状态机与越权删除均无测试；bug 表也无状态流转历史表，reopen_count 字段从未被服务端维护。",
+        "onlineMonitoring": "统计 bug.status 的取值分布，出现白名单外取值立即告警；监控 GET /bug/delete/:id 的调用量（正常业务应走 POST/DELETE）与单日删除量突增。"
+      }
+    }
+  },
+  {
+    "id": "sec-bug-detail-stubs",
+    "sectionNumber": "5.3",
+    "lineStart": 35,
+    "lineEnd": 43,
+    "title": "缺陷详情与缺陷元数据桩接口（GetBugDetail 软删可见性 + 平台/字段/模板/飞书选项占位）",
+    "paragraphs": [
+      "GetBugDetail 只吃路径参数 c.Param(\"id\")，service 用 Where(\"id = ? AND deleted = 0\").First(&b)，ErrRecordNotFound 统一返回 response.Fail(c, 404, \"缺陷不存在\")（handler/bug.go:35-43，service/bug.go:54-61）。",
+      "CurrentPlatform 固定返回字符串 \"LOCAL\"；CustomFieldHeader、TemplateOption、ColumnsOption、FeishuOptions 固定返回 []interface{}{}，全部忽略 projectId 参数（handler/bug.go:110-128，router.go:120-126）。",
+      "查询条件不含 project_id，任何持有 id 的调用方都能读取任意项目的缺陷详情（title、handleUsers、defectType 等字段全量回显）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-bug-detail-stubs",
+      "title": "缺陷详情缺少租户约束，元数据接口全为固定桩导致缺陷表单能力缺失",
+      "riskLevel": "P2",
+      "riskTag": "越权/契约破坏",
+      "riskDescription": "GetBugDetail 仅按 id + deleted = 0 定位，未校验 project_id：跨项目读取缺陷详情（含处理人、缺陷类型、发现阶段等元数据）构成越权信息泄漏；虽然响应是只读的，但对多租户 emulator 而言属于 P0 级数据可见性问题，此处因仅读单条记录降级为 P2 观察项。四个元数据接口（current-platform/custom-field/columns-option/template-option/feishu/*）全部返回固定值，前端缺陷表单的下拉选项、自定义表头列、模板与飞书同步入口都没有数据来源，缺陷创建表单只能用默认模板，且调用方无法从响应判断这是「桩」还是「该项目确实没有配置」。",
+      "impactScope": [
+        "handler.BugHandler.GetBugDetail",
+        "handler.BugHandler.CurrentPlatform",
+        "handler.BugHandler.CustomFieldHeader",
+        "handler/bug.go:111",
+        "service/bug.go:56",
+        "bug"
+      ],
+      "strategy": "httptest 挂载 /bug/get/:id、/bug/current-platform/:projectId、/bug/header/custom-field/:projectId：(1) 造 deleted=1 缺陷，断言 body.code=404 且 data 字面量 null；(2) 断言 current-platform 的 data 字符串等于 \"LOCAL\"；(3) 断言 custom-field 的 data 字面量为 []；(4) 造 orgB 缺陷，带 PROJECT: orgA 读取其 id，断言被拒绝。",
+      "verificationChecklist": [
+        "软删缺陷详情必须 code=404 + data=null，且 HTTP 恒为 200 的信封约定被固化",
+        "详情读取必须叠加 project_id/组织归属约束，跨项目 id 不得回显",
+        "元数据桩接口必须稳定返回约定类型（字符串 \"LOCAL\"、数组 []），参数缺失或超长 projectId 时不得 500"
+      ],
+      "cases": [
+        {
+          "id": "tc-bug-detail-stubs-01",
+          "name": "test_bug_detail_and_metadata_stub_envelope_contract",
+          "lang": "go",
+          "filePath": "internal/handler/bug_detail_stub_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupBugDetailTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Bug{}); err != nil {\n\t\tt.Fatalf(\"automigrate bug: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestBugDetailAndMetadataStubs_EnvelopeContract(t *testing.T) {\n\tdb := setupBugDetailTestDB(t)\n\tif err := db.Exec(\"DELETE FROM bug WHERE id = ?\", \"bug-soft-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.Bug{\n\t\tID:        \"bug-soft-1\",\n\t\tProjectID: \"p1\",\n\t\tTitle:     \"已删缺陷\",\n\t\tStatus:    \"NEW\",\n\t\tDeleted:   model.BitBool(true),\n\t\tCreatedAt: 1,\n\t\tUpdatedAt: 1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.GET(\"/bug/get/:id\", NewBugHandler().GetBugDetail)\n\tr.GET(\"/bug/current-platform/:projectId\", NewBugHandler().CurrentPlatform)\n\tr.GET(\"/bug/header/custom-field/:projectId\", NewBugHandler().CustomFieldHeader)\n\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/bug/get/bug-soft-1\", nil))\n\tvar envelope struct {\n\t\tCode    int             `json:\"code\"`\n\t\tData    json.RawMessage `json:\"data\"`\n\t\tMessage string          `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif envelope.Code != 404 {\n\t\tt.Errorf(\"软删缺陷详情 code=%d message=%s, want 404\", envelope.Code, envelope.Message)\n\t}\n\tif got := string(bytes.TrimSpace(envelope.Data)); got != \"null\" {\n\t\tt.Errorf(\"失败响应 data=%s, want null\", got)\n\t}\n\n\tw2 := httptest.NewRecorder()\n\tr.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/bug/current-platform/p1\", nil))\n\tif !bytes.Contains(w2.Body.Bytes(), []byte(`\"data\":\"LOCAL\"`)) {\n\t\tt.Errorf(\"current-platform 必须是字符串 LOCAL: body=%s\", w2.Body.String())\n\t}\n\n\tw3 := httptest.NewRecorder()\n\tr.ServeHTTP(w3, httptest.NewRequest(http.MethodGet, \"/bug/header/custom-field/p1\", nil))\n\tif !bytes.Contains(w3.Body.Bytes(), []byte(`\"data\":[]`)) {\n\t\tt.Errorf(\"缺陷自定义字段表头必须为空数组: body=%s\", w3.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "GET 软删缺陷 → code == 404 且 data 字面量 == \"null\"；current-platform → data == \"LOCAL\"；header/custom-field → data 字面量 == \"[]\"",
+            "dbStateDiff": "[READ-ONLY] bug 表仅被 SELECT，deleted/delete_time 不变",
+            "traceLog": "三条请求均 HTTP 200，桩接口 P99 < 5ms，无 SQL 慢查询"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "缺陷详情与元数据桩接口没有任何测试，租户约束在详情读取上完全缺失。",
+        "onlineMonitoring": "审计 /bug/get/:id 的 PROJECT 头与记录 project_id 不一致的请求；对元数据桩接口的空返回率做统计以识别前端功能不可用。"
+      }
+    }
+  },
+  {
+    "id": "sec-project-list",
+    "sectionNumber": "2.1",
+    "lineStart": 22,
+    "lineEnd": 39,
+    "title": "项目列表查询（GetProjectsByOrg/GetPublicProjects：enable 过滤与跨组织泄漏）",
+    "paragraphs": [
+      "GetProjectsByOrg 取路径参数 c.Param(\"orgId\")，service 侧查询固定带 Where(\"deleted = 0 AND enable = 1\")，仅当 orgId 非空且不等于 \"all\" 时才追加 organization_id = ? 条件，最后 Order(\"created_at DESC\")（handler/project.go:22-30，service/project.go:17-26）。",
+      "返回结果用 result := make([]model.ProjectSimple, 0, len(projects)) 显式初始化为空切片，因此无数据时 data 为 [] 而不是 null，只暴露 ID 与 Name 两个字段（service/project.go:28-35）。",
+      "GetPublicProjects 直接调用 GetProjectsByOrg(\"\")，即 orgId 为空串，organization_id 分支被跳过，返回全库所有 deleted = 0 AND enable = 1 的项目（service/project.go:38-40）；路由 GET /project/list/public 与 GET /project/list 都指向它（router.go:45-46、43-44）。",
+      "两个接口都不读取 c.GetHeader(\"ORGANIZATION\") 或会话中的组织上下文，鉴权中间件设置的 orgId 从未参与数据过滤（middleware.AuthMiddleware 只做 c.Set 不做校验）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-project-list",
+      "title": "公开项目列表跨组织全量泄漏，项目切换器可枚举他组织项目",
+      "riskLevel": "P0",
+      "riskTag": "越权/跨租户数据泄漏",
+      "riskDescription": "GET /project/list/public 与 GET /project/list 走 GetPublicProjects → GetProjectsByOrg(\"\")，为空串的 orgId 使 organization_id = ? 过滤被整体跳过，响应中返回所有组织下 enable = 1 的项目 ID 与名称。任何凭证（甚至无凭证，见 2.2 的鉴权绕过）都能拿到其它租户的项目清单，随后用这些 ID 直接读取项目详情、环境、用例与缺陷（这些接口普遍缺少 project 归属校验），形成横向越权的入口。前端「项目切换器」也会把无关组织项目列出来，用户看到不属于自己的项目名。",
+      "impactScope": [
+        "handler.ProjectHandler.GetPublicProjects",
+        "handler.ProjectHandler.GetProjectsByOrg",
+        "service.ProjectService.GetProjectsByOrg",
+        "service/project.go:39",
+        "router.go:45",
+        "project.organization_id"
+      ],
+      "strategy": "造 org-a 与 org-b 各一个 enable=1 项目：(1) GET /project/list/options/org-a 断言响应中不含 org-b 项目（按组织查询路径正确性）；(2) GET /project/list/public 带 ORGANIZATION: org-a 请求，断言 data 中不得出现 org-b 的项目 ID —— 当前实现必然失败，用以固化「公开列表必须按调用方组织收敛，或明确改名为全局列表并加权限」的结论；(3) 校验 enable=0 或 deleted=1 的项目不出现在任何列表分支中。",
+      "verificationChecklist": [
+        "public/list 必须按调用方 ORGANIZATION（或会话组织）过滤，不得返回其它组织的项目",
+        "deleted=1 或 enable=0 的项目在任何列表分支中都不可见",
+        "空结果 data 必须为 []（现有 make([]model.ProjectSimple, 0, n) 行为需保持），不得回退为 null",
+        "orgId=all 分支需有明确权限约束，不能成为绕过组织的后门"
+      ],
+      "cases": [
+        {
+          "id": "tc-project-list-01",
+          "name": "test_public_project_list_must_be_organization_scoped",
+          "lang": "go",
+          "filePath": "internal/handler/project_list_scope_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupProjectListTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Project{}); err != nil {\n\t\tt.Fatalf(\"automigrate project: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestGetPublicProjects_MustBeOrganizationScoped(t *testing.T) {\n\tdb := setupProjectListTestDB(t)\n\tif err := db.Exec(\"DELETE FROM project WHERE id IN (?, ?)\", \"proj-org-a\", \"proj-org-b\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\trows := []model.Project{\n\t\t{ID: \"proj-org-a\", OrganizationID: \"org-a\", Name: \"A组织项目\", Enable: model.BitBool(true), Deleted: model.BitBool(false), CreatedAt: 1, UpdatedAt: 1},\n\t\t{ID: \"proj-org-b\", OrganizationID: \"org-b\", Name: \"B组织项目\", Enable: model.BitBool(true), Deleted: model.BitBool(false), CreatedAt: 2, UpdatedAt: 2},\n\t}\n\tfor i := range rows {\n\t\tif err := db.Create(&rows[i]).Error; err != nil {\n\t\t\tt.Fatalf(\"seed %s: %v\", rows[i].ID, err)\n\t\t}\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.GET(\"/project/list/options/:orgId\", NewProjectHandler().GetProjectsByOrg)\n\tr.GET(\"/project/list/public\", NewProjectHandler().GetPublicProjects)\n\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/project/list/options/org-a\", nil))\n\tvar byOrg struct {\n\t\tCode int                   `json:\"code\"`\n\t\tData []model.ProjectSimple `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &byOrg); err != nil {\n\t\tt.Fatalf(\"byOrg unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tfor _, p := range byOrg.Data {\n\t\tif p.ID == \"proj-org-b\" {\n\t\t\tt.Errorf(\"按组织查询泄漏其它组织项目: %+v\", p)\n\t\t}\n\t}\n\n\tw2 := httptest.NewRecorder()\n\treq2 := httptest.NewRequest(http.MethodGet, \"/project/list/public\", nil)\n\treq2.Header.Set(\"ORGANIZATION\", \"org-a\")\n\tr.ServeHTTP(w2, req2)\n\tvar public struct {\n\t\tCode int                   `json:\"code\"`\n\t\tData []model.ProjectSimple `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w2.Body.Bytes(), &public); err != nil {\n\t\tt.Fatalf(\"public unmarshal: %v body=%s\", err, w2.Body.String())\n\t}\n\tfor _, p := range public.Data {\n\t\tif p.ID == \"proj-org-b\" {\n\t\t\tt.Errorf(\"公开项目列表跨组织泄漏: %+v (GetPublicProjects 调用 GetProjectsByOrg(空串), organization_id 分支被跳过)\", p)\n\t\t}\n\t}\n}\n",
+          "evidence": {
+            "assertion": "GET /project/list/options/org-a 的 data 不含 proj-org-b；GET /project/list/public（ORGANIZATION: org-a）的 data 不含 proj-org-b",
+            "dbStateDiff": "[READ-ONLY] 仅 SELECT project，测试前后 enable/deleted 不变",
+            "traceLog": "期望 HTTP 200、body.code=200；SQL 日志应含 organization_id = 'org-a' AND deleted = 0 AND enable = 1"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无项目列表的租户隔离测试，GetPublicProjects 的空参调用是历史遗留的全局查询，从未被质疑。",
+        "onlineMonitoring": "对 /project/list/public 的返回条目数做分布监控，单次返回项目数超过调用方组织成员可见范围时告警；审计响应中 project.organization_id 与 ORGANIZATION 头不一致的比例。"
+      }
+    }
+  },
+  {
+    "id": "sec-project-crud",
+    "sectionNumber": "2.2",
+    "lineStart": 41,
+    "lineEnd": 127,
+    "title": "项目增改删与详情（无鉴权拦截面、跨组织删除与静默零行更新）",
+    "paragraphs": [
+      "GetProjectDetail 用 Where(\"id = ? AND deleted = 0\").First，失败统一 response.Fail(c, 404, \"项目不存在\")，不校验项目所属组织（handler/project.go:41-49，service/project.go:42-49）。",
+      "CreateProject 要求 body.name binding:\"required\"，organizationId 为空时硬编码回落 \"100001\"，ID 由服务端 uuid 生成，Enable 固定 true（handler/project.go:51-80，service/project.go:51-66）。",
+      "UpdateProject 同时支持 c.Param(\"id\") 与 body.id，name/description 为空时该字段不更新（map 更新），Where 只有 id，不校验 organization_id，也不检查 deleted = 0；DELETE /projects/:id 的 DeleteProject 用 Updates(map) 写 deleted=true/delete_time/delete_user，同样只按 id 定位（service/project.go:68-89）。",
+      "鉴权中间件 AuthMiddleware 在请求完全不带 X-AUTH-TOKEN 与 Authorization 时不会写入 userId，handler 里 userId, _ := c.Get(\"userId\") 取不到值即回落 uid := \"admin\"，因此匿名请求可以创建/修改/删除项目并以 admin 身份写审计日志（middleware/auth.go:41-62，handler/project.go:62-66）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-project-crud",
+      "title": "项目写接口无鉴权拦截且无组织归属校验，匿名/跨组织可增删改任意项目",
+      "riskLevel": "P0",
+      "riskTag": "鉴权绕过/越权",
+      "riskDescription": "AuthMiddleware 对无 token 的请求既不放行也不拒绝，只是不设置 userId；所有 /projects 写接口都没有路由级权限判断，于是「不带任何凭证 POST /projects」会以 uid=admin 成功创建项目并写入审计日志，审计主体是伪造的 admin，事后无法追责。DeleteProject 仅按 id 过滤、无 organization_id 约束，携带 org-a 的上下文即可软删 org-b 的项目，属于跨租户破坏；由于项目软删不会级联处理 environment/functional_case/bug，删除后这些数据成为不可达的孤儿，重新创建同名项目也无法恢复关联。UpdateProject 在 id 为空或不存在时命中 0 行且不返回错误，接口回复 code=200「更新成功」，前端提示成功后数据未变。",
+      "impactScope": [
+        "middleware.AuthMiddleware",
+        "handler.ProjectHandler.CreateProject",
+        "handler.ProjectHandler.UpdateProject",
+        "handler.ProjectHandler.DeleteProject",
+        "service.ProjectService.DeleteProject",
+        "service/project.go:85",
+        "project",
+        "environment"
+      ],
+      "strategy": "使用 router.SetupRouter() 走完整中间件链：(1) 完全不带凭证 POST /projects，断言 body.code == 100401 且 project 表新增 0 行；(2) 造 org-b 项目后 DELETE /projects/proj-org-b 并带 ORGANIZATION: org-a，断言 project.deleted 仍为 0；(3) PUT /projects/:id 传空 name 与不存在 id，断言 code != 200 或 RowsAffected == 0；(4) 断言删除项目后 environment/functional_case 的 project_id 要么被级联清理要么被拒绝删除。",
+      "verificationChecklist": [
+        "无凭证请求必须返回 100401（response.Unauthorized）且不产生任何写操作，handler 不得回落 uid=admin",
+        "update/delete 必须校验 organization_id 归属与 deleted = 0，跨组织 id 不得命中",
+        "RowsAffected == 0 时必须返回 404 而非 200；删除项目需明确级联策略（拒绝删除/级联软删），不得留下孤儿 environment 与 functional_case",
+        "审计日志的 user 必须来自会话，不得因缺省回落而记录为 admin"
+      ],
+      "cases": [
+        {
+          "id": "tc-project-crud-01",
+          "name": "test_create_project_without_token_must_be_unauthorized",
+          "lang": "go",
+          "filePath": "internal/router/project_auth_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package router\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupProjectAuthTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Project{}); err != nil {\n\t\tt.Fatalf(\"automigrate project: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestCreateProject_WithoutToken_MustBeUnauthorized(t *testing.T) {\n\tdb := setupProjectAuthTestDB(t)\n\tif err := db.Exec(\"DELETE FROM project WHERE name = ?\", \"未鉴权项目\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\n\tengine := SetupRouter()\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/projects\", bytes.NewReader([]byte(`{\"name\":\"未鉴权项目\",\"organizationId\":\"org-a\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tengine.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode    int    `json:\"code\"`\n\t\tMessage string `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif envelope.Code != 100401 {\n\t\tt.Errorf(\"匿名创建项目未被拒绝: http=%d code=%d message=%s (AuthMiddleware 无 token 时不设置 userId, handler 回落 uid=admin)\", w.Code, envelope.Code, envelope.Message)\n\t}\n\n\tvar count int64\n\tif err := db.Model(&model.Project{}).Where(\"name = ?\", \"未鉴权项目\").Count(&count).Error; err != nil {\n\t\tt.Fatalf(\"count: %v\", err)\n\t}\n\tif count != 0 {\n\t\tt.Errorf(\"匿名请求写入 project 表 %d 行, want 0\", count)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "无凭证 POST /projects → body.code == 100401；project 表中 name=未鉴权项目 的行数 == 0",
+            "dbStateDiff": "期望 0 行 INSERT project；审计日志不得出现 create_user=admin 的创建记录",
+            "traceLog": "期望 HTTP 401（response.Unauthorized 写 401），Gin 访问日志显示 /projects 401 且无 SQL INSERT"
+          }
+        },
+        {
+          "id": "tc-project-crud-02",
+          "name": "test_delete_project_cross_organization_must_not_delete",
+          "lang": "go",
+          "filePath": "internal/handler/project_delete_scope_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupProjectScopeTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Project{}); err != nil {\n\t\tt.Fatalf(\"automigrate project: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestDeleteProject_CrossOrganization_MustNotDelete(t *testing.T) {\n\tdb := setupProjectScopeTestDB(t)\n\tif err := db.Exec(\"DELETE FROM project WHERE id = ?\", \"proj-org-b\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.Project{\n\t\tID:             \"proj-org-b\",\n\t\tOrganizationID: \"org-b\",\n\t\tName:           \"B组织项目\",\n\t\tEnable:         model.BitBool(true),\n\t\tDeleted:        model.BitBool(false),\n\t\tCreatedAt:      1,\n\t\tUpdatedAt:      1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.DELETE(\"/projects/:id\", NewProjectHandler().DeleteProject)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodDelete, \"/projects/proj-org-b\", nil)\n\treq.Header.Set(\"ORGANIZATION\", \"org-a\")\n\tr.ServeHTTP(w, req)\n\n\tvar row model.Project\n\tif err := db.Where(\"id = ?\", \"proj-org-b\").First(&row).Error; err != nil {\n\t\tt.Fatalf(\"reload: %v\", err)\n\t}\n\tif bool(row.Deleted) {\n\t\tt.Errorf(\"跨组织删除项目成功: deleted=1 (DeleteProject 的 Where 只有 id, 未校验 organization_id)\")\n\t}\n}\n",
+          "evidence": {
+            "assertion": "org-b 项目的 deleted == 0 且 delete_time 为 NULL；HTTP 响应 code 为非 200 业务码",
+            "dbStateDiff": "期望 UPDATE project SET deleted=1 ... WHERE id=? AND organization_id='org-a' 影响 0 行，project 表无变化",
+            "traceLog": "期望审计日志不出现「删除项目: proj-org-b」的成功记录"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无鉴权/越权测试，AuthMiddleware 的「无 token 不阻断」设计从未被端到端验证；项目删除也没有级联策略测试。",
+        "onlineMonitoring": "对 create_user/update_user 为 admin 但无有效会话 ID 的写操作打点；监控 project 软删后仍被引用的 environment/functional_case/bug 数量（孤儿数据巡检）。"
+      }
+    }
+  },
+  {
+    "id": "sec-environment-crud",
+    "sectionNumber": "2.3",
+    "lineStart": 130,
+    "lineEnd": 211,
+    "title": "运行环境增删改查（EnvironmentService：空列表 null、mock 零值写不回与物理删除）",
+    "paragraphs": [
+      "GetEnvironmentList 绑定匿名 body{ProjectID, Keyword}，绑定错误被 _ = 丢弃，projectId 为空时回落 c.Query(\"projectId\")，随后 service.GetList 执行 Where(\"project_id = ?\") + 可选 name LIKE，Order(\"pos ASC, created_at DESC\")（handler/project.go:130-146，service/environment.go:17-25）。",
+      "environment 模型没有 deleted/delete_time 字段，Delete 直接执行 config.DB.Where(\"id = ?\", id).Delete(&model.Environment{})，GORM 生成物理 DELETE，且 Where 不含 project_id（model/environment.go:3-14，service/environment.go:55-57）。",
+      "Update 使用 config.DB.Model(&model.Environment{}).Where(\"id = ?\", env.ID).Updates(env) 结构体更新：GORM 跳过零值字段，因此 Mock=false、Pos=0、Description 清空、Name 清空都无法写回，只有非零值才生效（service/environment.go:48-53）。",
+      "Add 不校验 ProjectID 是否为空，直接 uuid 生成 ID 并 Create，允许落库 project_id 为空的环境孤儿记录；删除路由同时暴露 GET 与 POST /project/environment/delete/:id（handler/project.go:158-178，router.go:61-62）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-environment-crud",
+      "title": "环境列表空结果 null 化 + mock 开关无法关闭 + 物理删除不可恢复与跨项目越权",
+      "riskLevel": "P0",
+      "riskTag": "数据污染/越权/契约破坏",
+      "riskDescription": "最直接的业务故障是 mock 开关关不掉：environment.mock 为 BitBool(false) 时是零值，Updates(env) 结构体更新会被 GORM 直接跳过，POST /project/environment/update 传 \"mock\":false 后返回 code=200「更新成功」，但库中 mock 仍为 1，前端以为已关闭 Mock 环境继续走桩数据，接口联调结论完全错误；同理 pos 置 0、description 清空均无效。其次删除是物理 DELETE 且 Where 只含 id：无认证、无组织/项目归属校验，任何调用方（含 GET 预取）都能永久删除他人环境，且无软删字段可供回滚或审计；删除项目时环境也不会级联清理，project 被软删后 environment 行仍存在，重新创建项目会看到残留环境。最后空结果时 var envs []model.Environment 为 nil，data 序列化为 null，环境下拉框 `.map` 崩溃。",
+      "impactScope": [
+        "handler.ProjectHandler.GetEnvironmentList",
+        "handler.ProjectHandler.UpdateEnvironment",
+        "handler.ProjectHandler.DeleteEnvironment",
+        "service.EnvironmentService.Update",
+        "service.EnvironmentService.Delete",
+        "service/environment.go:52",
+        "service/environment.go:56",
+        "environment"
+      ],
+      "strategy": "以 environment 表为观察对象：(1) 造 mock=1 的环境，POST /project/environment/update 传 mock=false，断言库中 mock == 0（当前必失败）；(2) 空项目请求 list，断言 data 字面量为 []；(3) 造 orgB 项目环境，带 PROJECT: orgA 调 GET /project/environment/delete/<id>，断言行仍存在（当前必被删除）；(4) 断言删除后可通过回收站/软删标志恢复，或接口明确拒绝带用例/计划引用的环境。",
+      "verificationChecklist": [
+        "update 必须支持把 mock 置 false、pos 置 0、description/name 清空（使用 map 或 Select 指定列）",
+        "空结果 data 必须为 []，Add 必须拒绝 projectId 为空的环境",
+        "delete 必须带 project_id 归属校验并改为软删（deleted/delete_time/delete_user），GET 路由不得具备写副作用",
+        "项目删除后不得残留引用已删项目 id 的 environment 行"
+      ],
+      "cases": [
+        {
+          "id": "tc-env-crud-01",
+          "name": "test_update_environment_disable_mock_must_persist_false",
+          "lang": "go",
+          "filePath": "internal/handler/environment_update_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupEnvUpdateTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Environment{}); err != nil {\n\t\tt.Fatalf(\"automigrate environment: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestUpdateEnvironment_DisableMock_MustPersistFalse(t *testing.T) {\n\tdb := setupEnvUpdateTestDB(t)\n\tif err := db.Exec(\"DELETE FROM environment WHERE id = ?\", \"env-mock-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.Environment{\n\t\tID:        \"env-mock-1\",\n\t\tProjectID: \"p1\",\n\t\tName:      \"Mock环境\",\n\t\tMock:      model.BitBool(true),\n\t\tPos:       5,\n\t\tCreatedAt: 1,\n\t\tUpdatedAt: 1,\n\t}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/project/environment/update\", NewProjectHandler().UpdateEnvironment)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/project/environment/update\", bytes.NewReader([]byte(`{\"id\":\"env-mock-1\",\"projectId\":\"p1\",\"name\":\"Mock环境\",\"mock\":false,\"pos\":0}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar row model.Environment\n\tif err := db.Where(\"id = ?\", \"env-mock-1\").First(&row).Error; err != nil {\n\t\tt.Fatalf(\"reload: %v\", err)\n\t}\n\tif bool(row.Mock) {\n\t\tt.Errorf(\"mock 未关闭: mock=1, want 0 (Updates(env) 结构体更新被 GORM 跳过零值字段, false 永远写不进去)\")\n\t}\n\tif row.Pos != 0 {\n\t\tt.Errorf(\"pos 未清零: pos=%d, want 0\", row.Pos)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "更新后 environment.mock == 0（false）且 environment.pos == 0",
+            "dbStateDiff": "期望 UPDATE environment SET mock=0, pos=0, updated_at=?, update_user=? WHERE id=? AND project_id=?；当前实现仅更新 updated_at/update_user",
+            "traceLog": "期望 HTTP 200、body.code=200；SQL 日志必须出现 mock 与 pos 列"
+          }
+        },
+        {
+          "id": "tc-env-crud-02",
+          "name": "test_environment_list_empty_and_cross_project_delete",
+          "lang": "go",
+          "filePath": "internal/handler/environment_scope_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/driver/mysql\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n)\n\nfunc setupEnvScopeTestDB(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tdb, err := gorm.Open(mysql.Open(\"root:root@tcp(127.0.0.1:3307)/aegis_test?charset=utf8mb4&parseTime=True&loc=Local\"), &gorm.Config{})\n\tif err != nil {\n\t\tt.Fatalf(\"open mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.Environment{}); err != nil {\n\t\tt.Fatalf(\"automigrate environment: %v\", err)\n\t}\n\tconfig.DB = db\n\treturn db\n}\n\nfunc TestEnvironmentListEmptyAndCrossProjectDelete(t *testing.T) {\n\tdb := setupEnvScopeTestDB(t)\n\tif err := db.Exec(\"DELETE FROM environment WHERE id = ?\", \"env-foreign-1\").Error; err != nil {\n\t\tt.Fatalf(\"clean fixture: %v\", err)\n\t}\n\tseed := model.Environment{ID: \"env-foreign-1\", ProjectID: \"orgB-project\", Name: \"B项目环境\", CreatedAt: 1, UpdatedAt: 1}\n\tif err := db.Create(&seed).Error; err != nil {\n\t\tt.Fatalf(\"seed: %v\", err)\n\t}\n\n\tgin.SetMode(gin.TestMode)\n\tr := gin.New()\n\tr.POST(\"/project/environment/list\", NewProjectHandler().GetEnvironmentList)\n\tr.GET(\"/project/environment/delete/:id\", NewProjectHandler().DeleteEnvironment)\n\n\tw := httptest.NewRecorder()\n\treq := httptest.NewRequest(http.MethodPost, \"/project/environment/list\", bytes.NewReader([]byte(`{\"projectId\":\"p-env-empty\"}`)))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tr.ServeHTTP(w, req)\n\n\tvar envelope struct {\n\t\tCode int             `json:\"code\"`\n\t\tData json.RawMessage `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {\n\t\tt.Fatalf(\"envelope unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif got := string(bytes.TrimSpace(envelope.Data)); got != \"[]\" {\n\t\tt.Errorf(\"空环境列表 data=%s, want [] (var envs []model.Environment 为 nil 时序列化为 null)\", got)\n\t}\n\n\tw2 := httptest.NewRecorder()\n\treq2 := httptest.NewRequest(http.MethodGet, \"/project/environment/delete/env-foreign-1\", nil)\n\treq2.Header.Set(\"PROJECT\", \"orgA-project\")\n\tr.ServeHTTP(w2, req2)\n\n\tvar left int64\n\tif err := db.Model(&model.Environment{}).Where(\"id = ?\", \"env-foreign-1\").Count(&left).Error; err != nil {\n\t\tt.Fatalf(\"count: %v\", err)\n\t}\n\tif left != 1 {\n\t\tt.Errorf(\"跨项目环境被越权物理删除: 剩余行数=%d, want 1 (Delete 的 Where 只有 id 且为物理 DELETE)\", left)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "空项目 list 的 data 字面量 == \"[]\"；跨项目 GET delete 后 environment 中 id=env-foreign-1 的行数仍为 1",
+            "dbStateDiff": "期望 list 无写入；delete 期望 0 行 DELETE（改为软删后应为 1 行 UPDATE deleted=1）",
+            "traceLog": "期望 list 200/code=200；越权 delete 返回非 200 业务码且审计日志标记 PROJECT 与记录归属不一致"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "environment 表无 deleted 字段，物理删除行为与 mock 零值更新缺陷均无测试覆盖，也无回收站设计。",
+        "onlineMonitoring": "对 environment 表的 DELETE 操作做审计与日删除量告警；定期校验 functional_case/bug/environment 中 project_id 不存在于 project 表的孤儿记录数量。"
+      }
+    }
+  }
+]

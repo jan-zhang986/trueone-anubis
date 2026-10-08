@@ -1,0 +1,16 @@
+# Local test tooling
+#
+# The DSH file sandbox denies writes to the shared Go build cache
+# (~/Library/Caches/go-build), so the test suite redirects GOCACHE and GOTMPDIR
+# into the workspace:
+#
+#   export GOCACHE=$PWD/.gocache GOTMPDIR=$PWD/.gotmp
+#   ANUBIS_IT=1 go test ./...
+#
+.gocache/
+.gotmp/
+
+# Build outputs
+/anubis
+/trueone-anubis
+*.test

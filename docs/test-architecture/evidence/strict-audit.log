@@ -1,0 +1,291 @@
+?   	trueone-anubis/cmd/server	[no test files]
+=== RUN   TestLoadConfig_ShippedFile
+--- PASS: TestLoadConfig_ShippedFile (0.00s)
+=== RUN   TestLoadConfig_PublishesGlobal
+--- PASS: TestLoadConfig_PublishesGlobal (0.00s)
+=== RUN   TestLoadConfig_MissingFileFails
+--- PASS: TestLoadConfig_MissingFileFails (0.00s)
+=== RUN   TestLoadConfig_MalformedYAMLFails
+--- PASS: TestLoadConfig_MalformedYAMLFails (0.00s)
+=== RUN   TestLoadConfig_MapsAllKeys
+--- PASS: TestLoadConfig_MapsAllKeys (0.00s)
+=== RUN   TestInitDB_RequiresLoadedConfig
+--- PASS: TestInitDB_RequiresLoadedConfig (0.00s)
+PASS
+ok  	trueone-anubis/config	0.025s
+?   	trueone-anubis/internal/handler	[no test files]
+=== RUN   TestAuthMiddleware_NoCredentialsStillReachesHandler
+--- PASS: TestAuthMiddleware_NoCredentialsStillReachesHandler (0.00s)
+=== RUN   TestAuthMiddleware_KnownSessionResolvesToUser
+--- PASS: TestAuthMiddleware_KnownSessionResolvesToUser (0.00s)
+=== RUN   TestAuthMiddleware_UnknownTokenIsAcceptedAsUserId
+--- PASS: TestAuthMiddleware_UnknownTokenIsAcceptedAsUserId (0.00s)
+=== RUN   TestAuthMiddleware_UnknownTokenMustBeRejected
+    auth_test.go:107: CONTRACT VIOLATION: an unknown token was accepted and published as userId="forged-token-value"; an unauthenticated caller can impersonate any identity
+--- FAIL: TestAuthMiddleware_UnknownTokenMustBeRejected (0.00s)
+=== RUN   TestAuthMiddleware_UncredentialedRequestMustBeRejected
+    auth_test.go:117: CONTRACT VIOLATION: a request with no credentials reached the business handler; the middleware must abort with 401
+--- FAIL: TestAuthMiddleware_UncredentialedRequestMustBeRejected (0.00s)
+=== RUN   TestAuthMiddleware_XAuthTokenTakesPrecedenceOverBearer
+--- PASS: TestAuthMiddleware_XAuthTokenTakesPrecedenceOverBearer (0.00s)
+=== RUN   TestAuthMiddleware_BearerFallback
+--- PASS: TestAuthMiddleware_BearerFallback (0.00s)
+=== RUN   TestAuthMiddleware_NonBearerAuthorizationIsIgnored
+--- PASS: TestAuthMiddleware_NonBearerAuthorizationIsIgnored (0.00s)
+=== RUN   TestAuthMiddleware_TenantHeadersArePropagated
+--- PASS: TestAuthMiddleware_TenantHeadersArePropagated (0.00s)
+=== RUN   TestAuthMiddleware_AbsentTenantHeadersLeaveContextEmpty
+--- PASS: TestAuthMiddleware_AbsentTenantHeadersLeaveContextEmpty (0.00s)
+=== RUN   TestSessionStore_Lifecycle
+--- PASS: TestSessionStore_Lifecycle (0.00s)
+=== RUN   TestSessionStore_ConcurrentAccessIsRaceFree
+--- PASS: TestSessionStore_ConcurrentAccessIsRaceFree (0.00s)
+=== RUN   TestCors_PreflightReturns204
+--- PASS: TestCors_PreflightReturns204 (0.00s)
+=== RUN   TestCors_UntrustedOriginMustNotBeGrantedAccess
+    auth_test.go:275: observed headers: Allow-Origin="https://evil.example" Allow-Credentials="true" Vary=""
+    auth_test.go:278: CONTRACT VIOLATION: Access-Control-Allow-Origin reflects the untrusted origin "https://evil.example"; an allowlist is required
+    auth_test.go:280: CONTRACT VIOLATION: credentialed cross-origin access is granted to "https://evil.example" (reflected Allow-Origin + Allow-Credentials: true)
+    auth_test.go:282: CONTRACT VIOLATION: Vary is ""; it must be "Origin" so shared caches key on the request origin
+--- FAIL: TestCors_UntrustedOriginMustNotBeGrantedAccess (0.00s)
+=== RUN   TestCors_WildcardWhenOriginAbsent
+--- PASS: TestCors_WildcardWhenOriginAbsent (0.00s)
+=== RUN   TestCors_AllowsCustomAuthHeaders
+--- PASS: TestCors_AllowsCustomAuthHeaders (0.00s)
+FAIL
+FAIL	trueone-anubis/internal/middleware	0.020s
+=== RUN   TestBitBool_ValueEncoding
+--- PASS: TestBitBool_ValueEncoding (0.00s)
+=== RUN   TestBitBool_ScanRepresentations
+=== RUN   TestBitBool_ScanRepresentations/driver_bytes_true
+=== RUN   TestBitBool_ScanRepresentations/driver_bytes_false
+=== RUN   TestBitBool_ScanRepresentations/ascii_one
+=== RUN   TestBitBool_ScanRepresentations/ascii_zero
+=== RUN   TestBitBool_ScanRepresentations/empty_byte_slice
+=== RUN   TestBitBool_ScanRepresentations/int64_one
+=== RUN   TestBitBool_ScanRepresentations/int64_zero
+=== RUN   TestBitBool_ScanRepresentations/bool_true
+=== RUN   TestBitBool_ScanRepresentations/bool_false
+=== RUN   TestBitBool_ScanRepresentations/NULL_column
+--- PASS: TestBitBool_ScanRepresentations (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/driver_bytes_true (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/driver_bytes_false (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/ascii_one (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/ascii_zero (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/empty_byte_slice (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/int64_one (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/int64_zero (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/bool_true (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/bool_false (0.00s)
+    --- PASS: TestBitBool_ScanRepresentations/NULL_column (0.00s)
+=== RUN   TestBitBool_ScanRejectsUnsupportedType
+--- PASS: TestBitBool_ScanRejectsUnsupportedType (0.00s)
+=== RUN   TestBitBool_MarshalJSONIsBoolean
+--- PASS: TestBitBool_MarshalJSONIsBoolean (0.00s)
+=== RUN   TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric
+=== RUN   TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric/true
+=== RUN   TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric/false
+=== RUN   TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric/1
+=== RUN   TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric/0
+--- PASS: TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric (0.00s)
+    --- PASS: TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric/true (0.00s)
+    --- PASS: TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric/false (0.00s)
+    --- PASS: TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric/1 (0.00s)
+    --- PASS: TestBitBool_UnmarshalJSONAcceptsBooleanAndNumeric/0 (0.00s)
+=== RUN   TestBitBool_UnmarshalJSONSilentlyIgnoresMalformedInput
+--- PASS: TestBitBool_UnmarshalJSONSilentlyIgnoresMalformedInput (0.00s)
+=== RUN   TestBitBool_JSONRoundTrip
+--- PASS: TestBitBool_JSONRoundTrip (0.00s)
+PASS
+ok  	trueone-anubis/internal/model	0.010s
+=== RUN   TestSuccess_EnvelopeContract
+--- PASS: TestSuccess_EnvelopeContract (0.00s)
+=== RUN   TestSuccessWithMsg_PreservesCustomSentinel
+--- PASS: TestSuccessWithMsg_PreservesCustomSentinel (0.00s)
+=== RUN   TestFail_ReturnsHTTP200WithBusinessCode
+--- PASS: TestFail_ReturnsHTTP200WithBusinessCode (0.00s)
+=== RUN   TestUnauthorized_ReturnsHTTP401AndCode100401
+--- PASS: TestUnauthorized_ReturnsHTTP401AndCode100401 (0.00s)
+=== RUN   TestSuccessPage_TotalPagesMath
+=== RUN   TestSuccessPage_TotalPagesMath/empty_result_set
+=== RUN   TestSuccessPage_TotalPagesMath/single_item
+=== RUN   TestSuccessPage_TotalPagesMath/exact_single_page
+=== RUN   TestSuccessPage_TotalPagesMath/one_past_the_boundary
+=== RUN   TestSuccessPage_TotalPagesMath/uneven_divisor
+=== RUN   TestSuccessPage_TotalPagesMath/pageSize_zero_must_not_divide_by_zero
+--- PASS: TestSuccessPage_TotalPagesMath (0.00s)
+    --- PASS: TestSuccessPage_TotalPagesMath/empty_result_set (0.00s)
+    --- PASS: TestSuccessPage_TotalPagesMath/single_item (0.00s)
+    --- PASS: TestSuccessPage_TotalPagesMath/exact_single_page (0.00s)
+    --- PASS: TestSuccessPage_TotalPagesMath/one_past_the_boundary (0.00s)
+    --- PASS: TestSuccessPage_TotalPagesMath/uneven_divisor (0.00s)
+    --- PASS: TestSuccessPage_TotalPagesMath/pageSize_zero_must_not_divide_by_zero (0.00s)
+=== RUN   TestSuccessPage_NilListMarshalsToNull
+--- PASS: TestSuccessPage_NilListMarshalsToNull (0.00s)
+=== RUN   TestSuccessPage_ZeroPageSizeOmitsOptionalKeys
+--- PASS: TestSuccessPage_ZeroPageSizeOmitsOptionalKeys (0.00s)
+PASS
+ok  	trueone-anubis/internal/response	0.016s
+=== RUN   TestRouteInventory_DualPrefixParity
+    router_test.go:94: route inventory: total=458 root=229 api=229
+--- PASS: TestRouteInventory_DualPrefixParity (0.00s)
+=== RUN   TestRouteInventory_BothPrefixesAnswerIdentically
+--- PASS: TestRouteInventory_BothPrefixesAnswerIdentically (0.00s)
+=== RUN   TestStubEndpoints_ReturnEnvelopeWithEmptyArray
+=== RUN   TestStubEndpoints_ReturnEnvelopeWithEmptyArray/case_repository_list
+=== RUN   TestStubEndpoints_ReturnEnvelopeWithEmptyArray/project_version_options
+=== RUN   TestStubEndpoints_ReturnEnvelopeWithEmptyArray/organization_template_list
+=== RUN   TestStubEndpoints_ReturnEnvelopeWithEmptyArray/status_flow_setting
+=== RUN   TestStubEndpoints_ReturnEnvelopeWithEmptyArray/organization_task_center
+--- PASS: TestStubEndpoints_ReturnEnvelopeWithEmptyArray (0.00s)
+    --- PASS: TestStubEndpoints_ReturnEnvelopeWithEmptyArray/case_repository_list (0.00s)
+    --- PASS: TestStubEndpoints_ReturnEnvelopeWithEmptyArray/project_version_options (0.00s)
+    --- PASS: TestStubEndpoints_ReturnEnvelopeWithEmptyArray/organization_template_list (0.00s)
+    --- PASS: TestStubEndpoints_ReturnEnvelopeWithEmptyArray/status_flow_setting (0.00s)
+    --- PASS: TestStubEndpoints_ReturnEnvelopeWithEmptyArray/organization_task_center (0.00s)
+=== RUN   TestStubEndpoint_TestPlanPageEmitsPageEnvelope
+--- PASS: TestStubEndpoint_TestPlanPageEmitsPageEnvelope (0.00s)
+=== RUN   TestStubEndpoints_ReturnOkLiteral
+=== RUN   TestStubEndpoints_ReturnOkLiteral/POST_/user/role/organization/add
+=== RUN   TestStubEndpoints_ReturnOkLiteral/POST_/user/role/organization/update
+=== RUN   TestStubEndpoints_ReturnOkLiteral/GET_/user/role/organization/delete/r-1
+=== RUN   TestStubEndpoints_ReturnOkLiteral/POST_/organization/status/flow/setting/status/definition/update
+--- PASS: TestStubEndpoints_ReturnOkLiteral (0.00s)
+    --- PASS: TestStubEndpoints_ReturnOkLiteral/POST_/user/role/organization/add (0.00s)
+    --- PASS: TestStubEndpoints_ReturnOkLiteral/POST_/user/role/organization/update (0.00s)
+    --- PASS: TestStubEndpoints_ReturnOkLiteral/GET_/user/role/organization/delete/r-1 (0.00s)
+    --- PASS: TestStubEndpoints_ReturnOkLiteral/POST_/organization/status/flow/setting/status/definition/update (0.00s)
+=== RUN   TestUnknownRouteReturns404
+--- PASS: TestUnknownRouteReturns404 (0.00s)
+=== RUN   TestMethodMismatchIsRejected
+--- PASS: TestMethodMismatchIsRejected (0.00s)
+=== RUN   TestPreflightIsHandledGlobally
+--- PASS: TestPreflightIsHandledGlobally (0.00s)
+=== RUN   TestRouteInventory_PrefixesAreKnown
+--- PASS: TestRouteInventory_PrefixesAreKnown (0.00s)
+PASS
+ok  	trueone-anubis/internal/router	0.021s
+?   	trueone-anubis/internal/service	[no test files]
+?   	trueone-anubis/internal/testsupport	[no test files]
+=== RUN   TestArtifact_BindsToSyncContract
+    artifact_test.go:54: artifact: repoUrl="file:///Users/zhangjian/vanguard-platform/trueone-anubis" commitSha="e0c8a01416a8" prdPath="docs/test-architecture/requirements-baseline.md" sections=56
+--- PASS: TestArtifact_BindsToSyncContract (0.00s)
+=== RUN   TestArtifact_EnumerationsAreInVocabulary
+    artifact_test.go:126: artifact: 56 sections, 121 cases (passed=49 failed=17 missing=55)
+--- PASS: TestArtifact_EnumerationsAreInVocabulary (0.00s)
+=== RUN   TestArtifact_LineAnchorsResolveAgainstBaseline
+    artifact_test.go:162: all 56 line anchors resolve inside requirements-baseline.md (349 lines)
+--- PASS: TestArtifact_LineAnchorsResolveAgainstBaseline (0.00s)
+=== RUN   TestArtifact_GapSectionsCarryNoticeOrFailures
+    artifact_test.go:200: artifact: 13 GAP sections, all carrying justification
+--- PASS: TestArtifact_GapSectionsCarryNoticeOrFailures (0.00s)
+=== RUN   TestLogin_SuccessIssuesSessionAndWritesAuditLog
+--- PASS: TestLogin_SuccessIssuesSessionAndWritesAuditLog (0.01s)
+=== RUN   TestLogin_WrongPasswordIsRejected
+--- PASS: TestLogin_WrongPasswordIsRejected (0.00s)
+=== RUN   TestLogin_UnknownUserIsIndistinguishableFromWrongPassword
+--- PASS: TestLogin_UnknownUserIsIndistinguishableFromWrongPassword (0.00s)
+=== RUN   TestLogin_AcceptsEmailAddress
+--- PASS: TestLogin_AcceptsEmailAddress (0.00s)
+=== RUN   TestLogin_MissingRequiredFieldIsRejected
+--- PASS: TestLogin_MissingRequiredFieldIsRejected (0.00s)
+=== RUN   TestIsLogin_WithoutCredentialsMustNotReturnAdminSession
+    auth_integration_test.go:175: observed: HTTP=200 code=200 id="admin" permissions=[* WORKSPACE:READ QUALITY_WORKSPACE:READ QUALITY:READ QUALITY:WRITE QUALITY:EXECUTE CASE:READ CASE:WRITE CASE:DELETE FUNCTIONAL_CASE:READ BUG:READ BUG:WRITE BUG:DELETE COV:READ COV:EXECUTE PROJECT_MANAGEMENT:READ SYSTEM:READ SYSTEM:WRITE SYSTEM_SETTING:READ ORGANIZATION:READ]
+    auth_integration_test.go:177: CONTRACT VIOLATION: /is-login returned HTTP 200 for an unauthenticated caller; it must return 401
+    auth_integration_test.go:179: CONTRACT VIOLATION: /is-login handed an anonymous caller the "admin" session (permissions=[* WORKSPACE:READ QUALITY_WORKSPACE:READ QUALITY:READ QUALITY:WRITE QUALITY:EXECUTE CASE:READ CASE:WRITE CASE:DELETE FUNCTIONAL_CASE:READ BUG:READ BUG:WRITE BUG:DELETE COV:READ COV:EXECUTE PROJECT_MANAGEMENT:READ SYSTEM:READ SYSTEM:WRITE SYSTEM_SETTING:READ ORGANIZATION:READ])
+--- FAIL: TestIsLogin_WithoutCredentialsMustNotReturnAdminSession (0.00s)
+=== RUN   TestIsLogin_WithValidTokenReturnsOwningUser
+--- PASS: TestIsLogin_WithValidTokenReturnsOwningUser (0.00s)
+=== RUN   TestSignout_InvalidatesSession
+--- PASS: TestSignout_InvalidatesSession (0.00s)
+=== RUN   TestGetKey_ReturnsPlaceholder
+--- PASS: TestGetKey_ReturnsPlaceholder (0.00s)
+=== RUN   TestGetUserPermissions_AdminHasWildcard
+--- PASS: TestGetUserPermissions_AdminHasWildcard (0.00s)
+=== RUN   TestGetUserPermissions_UnknownUserHasNoWildcard
+    authz_integration_test.go:33: observed permissions for an unrelated user: [BUG:DELETE PROJECT_API_DEBUG:READ FUNCTIONAL_CASE:READ+DELETE PROJECT_TEST_PLAN_REPORT:READ PROJECT_API_DEFINITION_CASE:READ+EXECUTE PROJECT_API_SCENARIO:READ PROJECT_LOG:READ PROJECT_BUG:READ+DELETE PROJECT_BUG:READ+EXPORT PROJECT_API_DEBUG:READ+UPDATE PROJECT_API_DEBUG:READ+EXECUTE PROJECT_API_DEFINITION:READ+EXECUTE PROJECT_ENVIRONMENT:READ+DELETE PROJECT_BUG:READ+ADD BUG:WRITE PROJECT_CUSTOM_FUNCTION:READ+UPDATE PROJECT_API_DEFINITION:READ PROJECT_API_SCENARIO:READ+EXECUTE FUNCTIONAL_CASE:READ+MINDER CASE_REVIEW:READ+RELEVANCE PROJECT_FILE_MANAGEMENT:READ+DELETE PROJECT_BUG:READ PROJECT_API_DEFINITION_MOCK:READ+DELETE PROJECT_API_DEFINITION_MOCK:READ+EXECUTE PROJECT_API_DEFINITION_DOC:READ+SHARE PROJECT_TEST_PLAN:READ PROJECT_TEST_PLAN_REPORT:READ+UPDATE PROJECT_APPLICATION_BUG:READ PROJECT_USER:READ PROJECT_BUG:READ+UPDATE PROJECT_API_DEFINITION_CASE:READ PROJECT_API_SCENARIO:READ+ADD CASE_REVIEW:READ+REVIEW PROJECT_API_DEFINITION_DOC:READ PROJECT_TEST_PLAN:READ+UPDATE PROJECT_TEST_PLAN:READ+DELETE PROJECT_ENVIRONMENT:READ+EXPORT PROJECT_CUSTOM_FUNCTION:READ+ADD PROJECT_API_DEFINITION_CASE:READ+UPDATE PROJECT_API_DEFINITION_MOCK:READ PROJECT_APPLICATION_TEST_PLAN:READ PROJECT_APPLICATION_API:READ PROJECT_APPLICATION_CASE:READ PROJECT_BASE_INFO:READ PROJECT_ENVIRONMENT:READ+ADD PROJECT_API_DEFINITION:READ+DELETE PROJECT_API_SCENARIO:READ+UPDATE CASE:READ FUNCTIONAL_CASE:READ+COMMENT PROJECT_TEST_PLAN:READ+ADD PROJECT_TEST_PLAN_REPORT:READ+DELETE PROJECT_CASE_TASK_CENTER:READ PROJECT_ENVIRONMENT:READ PROJECT_ENVIRONMENT:READ+IMPORT PROJECT_FILE_MANAGEMENT:READ PROJECT_CUSTOM_FUNCTION:READ+DELETE PROJECT_API_DEFINITION:READ+ADD PROJECT_GROUP:READ PROJECT_CASE_TASK_CENTER:READ+DELETE PROJECT_SCHEDULE_TASK_CENTER:READ PROJECT_FILE_MANAGEMENT:READ+UPDATE PROJECT_API_DEFINITION_CASE:READ+DELETE PROJECT_TEST_PLAN:READ+EXECUTE PROJECT_TEMPLATE:READ PROJECT_API_DEFINITION:READ+IMPORT PROJECT_API_REPORT:READ+DELETE PROJECT_API_REPORT:READ+SHARE CASE_REVIEW:READ PROJECT_TEST_PLAN_REPORT:READ+SHARE PROJECT_SCHEDULE_TASK_CENTER:READ+DELETE PROJECT_WORKFLOW_TEST_REPORT:READ PROJECT_LOG:UPDATE PROJECT_API_DEBUG:READ+ADD PROJECT_API_SCENARIO:READ+IMPORT PROJECT_API_SCENARIO:READ+EXPORT PROJECT_API_REPORT:READ+UPDATE FUNCTIONAL_CASE:READ+ADD CASE_REVIEW:READ+UPDATE PROJECT_FILE_MANAGEMENT:READ+ADD PROJECT_API_SCENARIO:READ+DELETE PROJECT_API_REPORT:READ BUG:READ FUNCTIONAL_CASE:READ+EXPORT PROJECT_FILE_MANAGEMENT:READ+DOWNLOAD PROJECT_BUG:READ+COMMENT PROJECT_CUSTOM_FUNCTION:READ+EXECUTE PROJECT_API_DEBUG:READ+DELETE PROJECT_API_DEFINITION:READ+UPDATE PROJECT_API_DEFINITION_MOCK:READ+ADD PROJECT_API_DEFINITION_MOCK:READ+UPDATE FUNCTIONAL_CASE:READ+UPDATE PROJECT_ENVIRONMENT:READ+UPDATE PROJECT_CUSTOM_FUNCTION:READ PROJECT_API_DEBUG:READ+IMPORT PROJECT_API_DEFINITION:READ+EXPORT PROJECT_API_DEFINITION_CASE:READ+ADD FUNCTIONAL_CASE:READ+IMPORT CASE_REVIEW:READ+ADD PROJECT_TEST_PLAN:READ+ASSOCIATION FUNCTIONAL_CASE:READ CASE_REVIEW:READ+DELETE PROJECT_MESSAGE:READ PROJECT_CASE_TASK_CENTER:EXEC+STOP PROJECT_SCHEDULE_TASK_CENTER:READ+UPDATE]
+--- PASS: TestGetUserPermissions_UnknownUserHasNoWildcard (0.00s)
+=== RUN   TestRunWorkItem_MustNotWriteOutsideItsWorkspace
+    authz_integration_test.go:59: observed: HTTP=200 code=200 itemStatus="FAILED" itemResult="FAILED" (item belongs to TESTARCH-ws-1790656909196563000, call targeted TESTARCH-ws-1790656909197622000)
+    authz_integration_test.go:62: CONTRACT VIOLATION: a work item owned by workspace TESTARCH-ws-1790656909196563000 was mutated through workspace TESTARCH-ws-1790656909197622000; the run endpoint does not scope by workspace or task
+--- FAIL: TestRunWorkItem_MustNotWriteOutsideItsWorkspace (0.01s)
+=== RUN   TestResetPassword_MustRequireAuthorization
+    authz_integration_test.go:90: observed: withCredentials HTTP=200 code=200 | anonymous HTTP=200 code=200 | passwordChanged=true
+    authz_integration_test.go:93: CONTRACT VIOLATION: an anonymous request reset the password of user TESTARCH-user-1790656909205028000: code=200 message=success
+    authz_integration_test.go:95: CONTRACT VIOLATION: the anonymous reset actually rewrote the stored credential for user TESTARCH-user-1790656909205028000
+--- FAIL: TestResetPassword_MustRequireAuthorization (0.00s)
+=== RUN   TestSwitchProject_MustNotTrustBodyUserId
+    authz_integration_test.go:118: observed: HTTP=200 code=200 victimLastProjectId="some-other-project"
+    authz_integration_test.go:120: CONTRACT VIOLATION: an unauthenticated request changed user TESTARCH-user-1790656909209652000's active project to "some-other-project" by supplying userId in the body
+--- FAIL: TestSwitchProject_MustNotTrustBodyUserId (0.00s)
+=== RUN   TestUpdateCurrentPassword_MustNotFallBackToAdmin
+    authz_integration_test.go:140: observed: HTTP=200 code=400 message=原密码错误
+    authz_integration_test.go:150: audit rows attributed to admin for password changes: 16
+--- PASS: TestUpdateCurrentPassword_MustNotFallBackToAdmin (0.00s)
+=== RUN   TestOrganizationMemberList_MustBeScopedToOrganization
+    authz_integration_test.go:191: observed: requested org=100001 returned=2 total=2; foreign user from org=1790513657180 leaked=true
+    authz_integration_test.go:194: CONTRACT VIOLATION: organisation 100001 returned member TESTARCH-user-1790656909213413000 who belongs to organisation 1790513657180; the organizationId parameter does not constrain the query
+--- FAIL: TestOrganizationMemberList_MustBeScopedToOrganization (0.00s)
+=== RUN   TestSyncDiffMatrix_PersistsAndReadsBack
+--- PASS: TestSyncDiffMatrix_PersistsAndReadsBack (0.00s)
+=== RUN   TestReportCaseExecution_FailedCaseMustNotRemainCovered
+    diffmatrix_integration_test.go:259: observed: caseStatus="FAILED" sectionDiffStatus="COVERED"
+    diffmatrix_integration_test.go:261: CONTRACT VIOLATION: a section whose only case is FAILED still reports diffStatus="COVERED"; the recomputation in ReportCaseExecution never runs the failed-only branch
+--- FAIL: TestReportCaseExecution_FailedCaseMustNotRemainCovered (0.00s)
+=== RUN   TestReportCaseExecution_SectionWithMissingCaseBecomesWarning
+--- PASS: TestReportCaseExecution_SectionWithMissingCaseBecomesWarning (0.00s)
+=== RUN   TestReportCaseExecution_SectionWithoutCasesMustBecomeGap
+    diffmatrix_integration_test.go:342: observed: cases=0 diffStatus="COVERED"
+    diffmatrix_integration_test.go:344: CONTRACT VIOLATION: a requirement section with zero test cases still reports diffStatus="COVERED"; the GAP branch is unreachable because caseFound requires an existing case
+--- FAIL: TestReportCaseExecution_SectionWithoutCasesMustBecomeGap (0.00s)
+=== RUN   TestGetDiffMatrix_MustNotFabricateEvidenceForAnUnsyncedWorkspace
+    diffmatrix_integration_test.go:376: observed: repoUrl="git@github.com:vanguard/trade-payment-service.git" prdPath="docs/iterations/2026-Q3-sprint-12/prd.md" sections=5 fabricatedPassedCases=4
+    diffmatrix_integration_test.go:379: CONTRACT VIOLATION: GET diff-matrix invented an asset for the unrelated repository "git@github.com:vanguard/trade-payment-service.git"
+    diffmatrix_integration_test.go:381: CONTRACT VIOLATION: GET diff-matrix invented 4 test cases already marked PASSED for a workspace that was never analysed
+    diffmatrix_integration_test.go:386: CONTRACT VIOLATION: the fabricated asset was persisted into quality_workspace.metadata for TESTARCH-ws-1790656909230836000
+--- FAIL: TestGetDiffMatrix_MustNotFabricateEvidenceForAnUnsyncedWorkspace (0.00s)
+=== RUN   TestGenerateReport_PersistsReportWithSnapshot
+    diffmatrix_integration_test.go:426: observed: code=500 message=Error 3140 (22032): Invalid JSON text: "The document is empty." at position 0 in value for column 'quality_report.metadata'. reportId=""
+    diffmatrix_integration_test.go:428: CONTRACT VIOLATION: report generation failed: code=500 message=Error 3140 (22032): Invalid JSON text: "The document is empty." at position 0 in value for column 'quality_report.metadata'.
+--- FAIL: TestGenerateReport_PersistsReportWithSnapshot (0.00s)
+=== RUN   TestGenerateDiffMatrixFromMarkdown_RejectsEmptyDocument
+--- PASS: TestGenerateDiffMatrixFromMarkdown_RejectsEmptyDocument (0.00s)
+=== RUN   TestGenerateDiffMatrixFromMarkdown_LiveModelCall
+    diffmatrix_integration_test.go:457: live model call is opt-in; set ANUBIS_LIVE_LLM=1 to exercise the DeepSeek API
+--- SKIP: TestGenerateDiffMatrixFromMarkdown_LiveModelCall (0.00s)
+=== RUN   TestReportCaseExecution_PersistsEvidence
+--- PASS: TestReportCaseExecution_PersistsEvidence (0.00s)
+=== RUN   TestReportCaseExecution_UnknownWorkspaceFails
+    diffmatrix_integration_test.go:557: observed: HTTP=200 code=200 message=success
+    diffmatrix_integration_test.go:559: CONTRACT VIOLATION: reporting case execution against a non-existent workspace returned code=200; the not-found error is swallowed by the fabricated default matrix
+--- FAIL: TestReportCaseExecution_UnknownWorkspaceFails (0.00s)
+=== RUN   TestQualityWorkspace_Save_MinimalPayloadCreatesRow
+    workspace_integration_test.go:55: observed: code=500 message=Error 3140 (22032): Invalid JSON text: "The document is empty." at position 0 in value for column 'quality_workspace.tags'. workspaceId="" status=""
+    workspace_integration_test.go:67: CONTRACT VIOLATION: creating a workspace with the minimal form payload failed: code=500 message=Error 3140 (22032): Invalid JSON text: "The document is empty." at position 0 in value for column 'quality_workspace.tags'.
+--- FAIL: TestQualityWorkspace_Save_MinimalPayloadCreatesRow (0.00s)
+=== RUN   TestGetStats_FailedSuiteMustNotReportReleaseReady
+    workspace_integration_test.go:91: observed: total=3 passed=0 failed=3 blocked=0 skipped=0 todo=0 allDone=true passRate=0.00 executionRate=100.00 releaseConclusion="READY"
+    workspace_integration_test.go:111: CONTRACT VIOLATION: a suite with 3/3 FAILED items still reports releaseConclusion="READY"; the release gate is hardcoded and ignores results
+    workspace_integration_test.go:114: CONTRACT VIOLATION: allDone=true while 3 items are FAILED; completeness must not be conflated with success
+--- FAIL: TestGetStats_FailedSuiteMustNotReportReleaseReady (0.00s)
+=== RUN   TestGetStats_CountersAndRatesAreDerivedCorrectly
+    workspace_integration_test.go:142: observed: total=6 passed=1 failed=1 blocked=1 skipped=1 todo=1 inProgress=1 passRate=25.00 executionRate=66.67
+--- PASS: TestGetStats_CountersAndRatesAreDerivedCorrectly (0.01s)
+=== RUN   TestCompleteTask_PersistsStatus
+--- PASS: TestCompleteTask_PersistsStatus (0.00s)
+=== RUN   TestCompleteTask_NonExistentTaskMustNotReportSuccess
+    workspace_integration_test.go:221: observed: HTTP=200 code=200 message="success"
+    workspace_integration_test.go:223: CONTRACT VIOLATION: completing a non-existent task reported code=200 message="success"; an update that matched no row must not report success
+--- FAIL: TestCompleteTask_NonExistentTaskMustNotReportSuccess (0.00s)
+=== RUN   TestGetWorkspaceDetail_MissingWorkspaceIs404
+--- PASS: TestGetWorkspaceDetail_MissingWorkspaceIs404 (0.00s)
+=== RUN   TestWorkspacePage_PagingMetadataIsConsistent
+    workspace_integration_test.go:247: fixture workspace: TESTARCH-ws-1790656909257806000
+--- PASS: TestWorkspacePage_PagingMetadataIsConsistent (0.00s)
+=== RUN   TestSaveTask_MinimalPayloadCreatesRow
+    workspace_integration_test.go:325: observed: code=500 message=Error 3140 (22032): Invalid JSON text: "The document is empty." at position 0 in value for column 'quality_task.metadata'. taskId=""
+    workspace_integration_test.go:327: CONTRACT VIOLATION: creating a task with the minimal form payload failed: code=500 message=Error 3140 (22032): Invalid JSON text: "The document is empty." at position 0 in value for column 'quality_task.metadata'.
+--- FAIL: TestSaveTask_MinimalPayloadCreatesRow (0.00s)
+FAIL
+FAIL	trueone-anubis/tests/integration	0.123s
+FAIL

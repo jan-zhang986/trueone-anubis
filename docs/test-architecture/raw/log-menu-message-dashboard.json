@@ -1,0 +1,779 @@
+[
+  {
+    "id": "sec-6-1-efficiency-overview",
+    "sectionNumber": "6.1",
+    "lineStart": 19,
+    "lineEnd": 38,
+    "title": "效率概览与活动指标接口（/metrics/efficiency/overview、/metrics/efficiency/activity）",
+    "paragraphs": [
+      "EfficiencyOverview 只从 `c.GetHeader(\"PROJECT\")` 或 `c.Query(\"projectId\")` 取项目上下文，尽管 router.go:129-130 同时注册了 POST 与 GET；POST 场景下请求体从未被 ShouldBindJSON 读取。",
+      "service.DashboardService.GetOverview 的返回结构 EfficiencyOverview 只有 totalCases/totalWorkspaces/totalBugs/totalProjects 四个字段，而前端 useSnapTestData.ts 读取 `d.dataGenerationEfficiency.totalEstimatedTime`、`d.dataFactoryStats`、`d.mqStats`、`d.automationStats`、`d.functionalCaseExecutionStats`、`d.aiCaseStats` 等十余个字段。",
+      "GetOverview 恒为 `return &EfficiencyOverview{...}, nil`，四个 Count 的错误全部丢弃，handler 的 `if err != nil { response.Fail(c, 500, ...) }` 是死代码；projQuery 从不应用 project_id 条件（只有 caseQuery/wsQuery/bugQuery 被收敛）。",
+      "EfficiencyActivity 是固定桩：返回 `{\"series\": [], \"breakdown\": gin.H{}}`，缺少前端契约中的 totalActivity/toolAdoptionRate/onlineUserStats；Envelope 由 response.Success 统一封装为 {code,data,message}，code 恒为 200。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-6-1-efficiency-overview",
+      "title": "效率大盘 POST 入参项目维度被整段忽略且返回字段名不符合前端契约",
+      "riskLevel": "P0",
+      "riskTag": "契约破坏",
+      "riskDescription": "前端用 axios.post(`${AEGIS_API_BASE_URL}/metrics/efficiency/overview`, buildParams()) 提交 projectIds/userId/startDate 等筛选条件，AEGIS_API_BASE_URL 在开发环境由 vite 代理到 http://localhost:8081（即本服务）。handler 完全不读 body，因此无论前端选中哪个项目，大盘都展示全租户聚合值（实测 body {\"projectIds\":[\"nonexistent-project\"]} 返回 totalCases=14，与不带筛选完全一致）；同时响应体只有 4 个字段，前端读取的 dataGenerationEfficiency/mqStats/automationStats 等全部为 undefined，所有卡片显示为空/—。此外 4 个 Count 的错误被吞掉，DB 故障时接口仍返回 code=200 + 全 0，监控侧看不到任何失败信号。",
+      "impactScope": [
+        "handler.DashboardHandler.EfficiencyOverview",
+        "handler.DashboardHandler.EfficiencyActivity",
+        "service.DashboardService.GetOverview",
+        "internal/handler/dashboard.go:19-38",
+        "internal/service/dashboard.go:21-46",
+        "internal/router/router.go:129-132",
+        "table functional_case, quality_workspace, bug, project"
+      ],
+      "strategy": "在独立测试库造 2 个 project（p-1/p-2）与各 1 条 functional_case，注册 POST /metrics/efficiency/overview；分别以 body {\"projectIds\":[\"p-2\"]} 与 query ?projectId=p-2 请求，断言 body 场景 totalCases 收敛为 1、query 场景 totalCases 与 totalProjects 口径一致，并断言响应 key 集合包含 dataGenerationEfficiency；失败时直接打印实际 data 的 key 列表。",
+      "verificationChecklist": [
+        "POST body.projectIds=[p-2] 时 totalCases 必须为 1（当前为 2/全量）",
+        "同一响应内 totalCases 与 totalProjects 的项目口径必须一致",
+        "data 必须包含前端读取的 dataGenerationEfficiency/mqStats/automationStats 等字段",
+        "DB 不可用时应返回 code!=200，而非 code=200 且全 0",
+        "EfficiencyActivity 的 data 需含 totalActivity/series[].dimension/items"
+      ],
+      "cases": [
+        {
+          "id": "tc-6-1-efficiency-overview-01",
+          "name": "TestDashFM_EfficiencyOverview_IgnoresBodyProjectIdsAndBreaksFieldContract",
+          "lang": "go",
+          "filePath": "internal/handler/dashboard_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n    \"bytes\"\n    \"encoding/json\"\n    \"net/http\"\n    \"net/http/httptest\"\n    \"os\"\n    \"testing\"\n\n    \"github.com/gin-gonic/gin\"\n    \"gorm.io/driver/mysql\"\n    \"gorm.io/gorm\"\n    \"gorm.io/gorm/logger\"\n\n    \"trueone-anubis/config\"\n    \"trueone-anubis/internal/handler\"\n    \"trueone-anubis/internal/model\"\n    \"trueone-anubis/internal/router\"\n)\n\ntype dashFMEAEnvelope struct {\n    Code    int             `json:\"code\"`\n    Data    json.RawMessage `json:\"data\"`\n    Message string          `json:\"message\"`\n}\n\n// setupDashFMEA 使用独立库 anubis_fmea_test（TEST_MYSQL_DSN 需以 / 结尾，例如 root:root@tcp(127.0.0.1:3307)/）\nfunc setupDashFMEA(t *testing.T) *gorm.DB {\n    t.Helper()\n    dsn := os.Getenv(\"TEST_MYSQL_DSN\")\n    if dsn == \"\" {\n        dsn = \"root:root@tcp(127.0.0.1:3307)/\"\n    }\n    admin, err := gorm.Open(mysql.Open(dsn+\"?charset=utf8mb4&parseTime=true&loc=Local\"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})\n    if err != nil {\n        t.Skipf(\"MySQL 测试实例不可用，跳过: %v\", err)\n    }\n    if err := admin.Exec(\"CREATE DATABASE IF NOT EXISTS anubis_fmea_test DEFAULT CHARSET utf8mb4\").Error; err != nil {\n        t.Skipf(\"无法创建测试库，跳过: %v\", err)\n    }\n    db, err := gorm.Open(mysql.Open(dsn+\"anubis_fmea_test?charset=utf8mb4&parseTime=true&loc=Local\"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})\n    if err != nil {\n        t.Fatalf(\"连接测试库失败: %v\", err)\n    }\n    if err := db.AutoMigrate(&model.Project{}, &model.FunctionalCase{}, &model.QualityWorkspace{}, &model.Bug{}, &model.OperationLog{}); err != nil {\n        t.Fatalf(\"AutoMigrate 失败: %v\", err)\n    }\n    for _, m := range []interface{}{&model.Project{}, &model.FunctionalCase{}, &model.QualityWorkspace{}, &model.Bug{}, &model.OperationLog{}} {\n        if err := db.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(m).Error; err != nil {\n            t.Fatalf(\"清理测试数据失败: %v\", err)\n        }\n    }\n    config.DB = db\n    return db\n}\n\nfunc dashFMEAKeys(m map[string]interface{}) []string {\n    keys := make([]string, 0, len(m))\n    for k := range m {\n        keys = append(keys, k)\n    }\n    return keys\n}\n\nfunc TestDashFM_EfficiencyOverview_IgnoresBodyProjectIdsAndBreaksFieldContract(t *testing.T) {\n    db := setupDashFMEA(t)\n    if err := db.Create(&[]model.Project{\n        {ID: \"p-1\", OrganizationID: \"org-A\", Name: \"项目1\", Deleted: model.BitBool(false)},\n        {ID: \"p-2\", OrganizationID: \"org-A\", Name: \"项目2\", Deleted: model.BitBool(false)},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n    if err := db.Create(&[]model.FunctionalCase{\n        {ID: \"c-1\", ProjectID: \"p-1\", Name: \"用例1\", Deleted: model.BitBool(false)},\n        {ID: \"c-2\", ProjectID: \"p-2\", Name: \"用例2\", Deleted: model.BitBool(false)},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.POST(\"/metrics/efficiency/overview\", handler.NewDashboardHandler().EfficiencyOverview)\n\n    call := func(target, body string) (int, map[string]interface{}) {\n        req := httptest.NewRequest(http.MethodPost, target, bytes.NewBufferString(body))\n        req.Header.Set(\"Content-Type\", \"application/json\")\n        w := httptest.NewRecorder()\n        r.ServeHTTP(w, req)\n        var env dashFMEAEnvelope\n        if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n            t.Fatalf(\"响应不是 {code,data,message} 契约结构: %v body=%s\", err, w.Body.String())\n        }\n        var data map[string]interface{}\n        if err := json.Unmarshal(env.Data, &data); err != nil {\n            t.Fatalf(\"data 不是对象: %v data=%s\", err, env.Data)\n        }\n        return env.Code, data\n    }\n\n    if code, data := call(\"/metrics/efficiency/overview\", `{}`); code != 200 || data[\"totalProjects\"] != float64(2) || data[\"totalCases\"] != float64(2) {\n        t.Fatalf(\"前置条件失败：期望全局 totalProjects=2/totalCases=2，实际 code=%d data=%v\", code, data)\n    }\n\n    _, byBody := call(\"/metrics/efficiency/overview\", `{\"projectIds\":[\"p-2\"]}`)\n    if byBody[\"totalCases\"] != float64(1) {\n        t.Errorf(\"body.projectIds 未被消费：期望 totalCases=1，实际 %v（前端 buildParams 只发 body，项目维度筛选被静默忽略）\", byBody[\"totalCases\"])\n    }\n\n    _, byQuery := call(\"/metrics/efficiency/overview?projectId=p-2\", `{}`)\n    if byQuery[\"totalCases\"] != float64(1) {\n        t.Errorf(\"query projectId 应命中 1 条用例，实际 %v\", byQuery[\"totalCases\"])\n    }\n    if byQuery[\"totalProjects\"] != float64(1) {\n        t.Errorf(\"projectId=p-2 时 totalProjects 应为 1（projQuery 未应用项目条件，同一响应口径不一致），实际 %v\", byQuery[\"totalProjects\"])\n    }\n\n    _, data := call(\"/metrics/efficiency/overview\", `{}`)\n    if _, ok := data[\"dataGenerationEfficiency\"]; !ok {\n        t.Errorf(\"响应缺少前端依赖字段 dataGenerationEfficiency（eff?.totalEstimatedTime 恒为 undefined），实际 keys=%v\", dashFMEAKeys(data))\n    }\n}",
+          "evidence": {
+            "assertion": "断言 POST body {\"projectIds\":[\"p-2\"]} 的 data.totalCases==1、?projectId=p-2 的 data.totalProjects==1、data 含 key dataGenerationEfficiency",
+            "dbStateDiff": "[READ-ONLY] 仅 SELECT COUNT(*) FROM functional_case/project，无写操作",
+            "traceLog": "HTTP 200 + code=200；实测当前实现 body 场景仍返回 totalCases=2（全量 14），data 仅 4 个 key"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "仓库内无 *_test.go，且 go.mod 只有 gorm.io/driver/mysql（无 sqlite），测试必须依赖外部 MySQL；大盘真实字段由另一个后端（生产 aegis.tst.spotter.ink）提供，契约以 mock 为准无从回归。",
+        "onlineMonitoring": "对 /metrics/efficiency/overview 埋点：请求体是否被消费（body.projectIds 非空但返回 totalCases 与全局相同则告警）；count 类 SQL 失败必须上报 metric，禁止静默返回 0。"
+      }
+    }
+  },
+  {
+    "id": "sec-6-2-requirement-quality",
+    "sectionNumber": "6.2",
+    "lineStart": 40,
+    "lineEnd": 85,
+    "title": "需求质量指标、列表、概览与筛选项（/metrics/requirement-quality*）",
+    "paragraphs": [
+      "RequirementQualityMetrics 硬编码 `{\"workspaceCount\": 4, \"caseCount\": 14, \"passRate\": 100.0, \"bugCount\": 0}`；RequirementQualityOverview 硬编码 `{\"currentDemandCount\": 4, \"caseCount\": 14, \"bugCount\": 0, \"passRate\": 100.0}`，两者都不查库。",
+      "前端 RequirementQualityOverviewDTO 的字段是 requirementTotal/caseTotalCount/caseExecutedCount/executionRate/passRate/firstPassRate/avgDefectRatePer1k，与本服务返回的 currentDemandCount/caseCount/bugCount 完全错位（实测返回 keys: bugCount/caseCount/currentDemandCount/passRate）。",
+      "RequirementQualityList 恒定 `response.SuccessPage(c, []interface{}{}, 0, 1, 10)`，忽略请求的 current/pageSize 与全部筛选条件（实测 {\"current\":4,\"pageSize\":50} 回显 current=1/pageSize=10）。",
+      "RequirementQualityFilterOptions 返回 `{\"projectList\": [], \"statusList\": []}`，前端 RequirementQualityFilterOptionsDTO 期望 projectOptions/requirementOptions/statusOptions；router.go 也未注册前端 REQUIREMENT_QUALITY_URLS.STORY_SEARCH/STORY_NAMES。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-6-2-requirement-quality",
+      "title": "需求质量视图字段名错位、分页元数据固定为 1/10 且存在虚假 100% 通过率",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/静默失败",
+      "riskDescription": "需求质量视图是 snap-test/需求质量子页面的数据源，三处接口均与前端 DTO 不匹配：概览卡因 requirementTotal/caseTotalCount/caseExecutedCount 缺失而全部渲染为 0；筛选项因 projectOptions/requirementOptions/statusOptions 缺失而三个下拉全空；列表恒返回空数组且分页元数据固定 current=1/pageSize=10，前端 setPager({total: listRes?.total}) 得到 0，用户看到「无数据」而非「未实现」。更危险的是空库仍返回 passRate=100 的硬编码绿灯，会被误读为质量达标；story-search/story-names 未注册，前端调用得到 gin 裸文本 404，破坏统一 {code,data,message} 外壳。",
+      "impactScope": [
+        "handler.DashboardHandler.RequirementQualityMetrics",
+        "handler.DashboardHandler.RequirementQualityList",
+        "handler.DashboardHandler.RequirementQualityOverview",
+        "handler.DashboardHandler.RequirementQualityFilterOptions",
+        "internal/handler/dashboard.go:40-85",
+        "internal/router/router.go:133-138",
+        "前端 DTO: src/services/requirement-quality/types.ts RequirementQualityOverviewDTO/RequirementQualityFilterOptionsDTO"
+      ],
+      "strategy": "注册 GET /metrics/requirement-quality/filter-options、POST /list、POST /overview，断言 filter-options 含 projectOptions/requirementOptions/statusOptions；断言 /list 回显请求的 current/pageSize；断言空库 overview 的 passRate 不等于硬编码 100 且含 requirementTotal；再用 router.SetupRouter() 断言 GET /metrics/requirement-quality/story-search?keyword=abc 返回 HTTP 200 且响应体为 JSON 外壳。",
+      "verificationChecklist": [
+        "空库 overview.passRate 不得为硬编码 100（应为 0 或 null）",
+        "list 必须回显请求的 current/pageSize 且 total 与 WHERE 条件一致",
+        "filter-options 必须含 projectOptions/requirementOptions/statusOptions 三个数组且来自 project 表",
+        "story-search/story-names 必须注册并返回统一外壳",
+        "概览字段名必须与 RequirementQualityOverviewDTO 完全一致"
+      ],
+      "cases": [
+        {
+          "id": "tc-6-2-requirement-quality-01",
+          "name": "TestDashFM_RequirementQuality_FieldNamesAndHardcodedPaging",
+          "lang": "go",
+          "filePath": "internal/handler/dashboard_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 以下用例复用本文件顶部的 setupDashFMEA / dashFMEAEnvelope / dashFMEAKeys helper =====\n\nfunc TestDashFM_RequirementQuality_FieldNamesAndHardcodedPaging(t *testing.T) {\n    setupDashFMEA(t)\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    h := handler.NewDashboardHandler()\n    r.GET(\"/metrics/requirement-quality/filter-options\", h.RequirementQualityFilterOptions)\n    r.POST(\"/metrics/requirement-quality/list\", h.RequirementQualityList)\n    r.POST(\"/metrics/requirement-quality/overview\", h.RequirementQualityOverview)\n\n    call := func(method, target, body string) map[string]interface{} {\n        req := httptest.NewRequest(method, target, bytes.NewBufferString(body))\n        if body != \"\" {\n            req.Header.Set(\"Content-Type\", \"application/json\")\n        }\n        w := httptest.NewRecorder()\n        r.ServeHTTP(w, req)\n        var env dashFMEAEnvelope\n        if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n            t.Fatalf(\"响应不是 {code,data,message} 契约结构: %v body=%s\", err, w.Body.String())\n        }\n        var data map[string]interface{}\n        if err := json.Unmarshal(env.Data, &data); err != nil {\n            t.Fatalf(\"data 不是对象: %v data=%s\", err, env.Data)\n        }\n        return data\n    }\n\n    opts := call(http.MethodGet, \"/metrics/requirement-quality/filter-options\", \"\")\n    for _, key := range []string{\"projectOptions\", \"requirementOptions\", \"statusOptions\"} {\n        if _, ok := opts[key]; !ok {\n            t.Errorf(\"filter-options 缺少前端契约字段 %q，实际 keys=%v\", key, dashFMEAKeys(opts))\n        }\n    }\n\n    listData := call(http.MethodPost, \"/metrics/requirement-quality/list\", `{\"current\":4,\"pageSize\":50}`)\n    if listData[\"current\"] != float64(4) || listData[\"pageSize\"] != float64(50) {\n        t.Errorf(\"分页元数据未回显请求值：期望 current=4/pageSize=50，实际 current=%v pageSize=%v\", listData[\"current\"], listData[\"pageSize\"])\n    }\n\n    ov := call(http.MethodPost, \"/metrics/requirement-quality/overview\", `{\"current\":1,\"pageSize\":1}`)\n    if _, ok := ov[\"requirementTotal\"]; !ok {\n        t.Errorf(\"overview 缺少前端契约字段 requirementTotal，实际 keys=%v\", dashFMEAKeys(ov))\n    }\n    if ov[\"passRate\"] == float64(100) {\n        t.Errorf(\"空库概览仍返回 passRate=100（硬编码常量），对前端是虚假绿灯\")\n    }\n\n    full := router.SetupRouter()\n    w := httptest.NewRecorder()\n    full.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/metrics/requirement-quality/story-search?keyword=abc\", nil))\n    if w.Code != http.StatusOK {\n        t.Errorf(\"期望 story-search 可用，实际 HTTP %d body=%s\", w.Code, w.Body.String())\n    }\n    if !json.Valid(w.Body.Bytes()) {\n        t.Errorf(\"story-search 返回非 JSON，破坏统一响应外壳，body=%s\", w.Body.String())\n    }\n}",
+          "evidence": {
+            "assertion": "断言 filter-options 含 projectOptions/requirementOptions/statusOptions、list 回显 current=4/pageSize=50、空库 overview.passRate!=100 且含 requirementTotal、story-search 返回 HTTP 200+JSON",
+            "dbStateDiff": "[READ-ONLY] 无任何写操作（接口本身不落库）",
+            "traceLog": "HTTP 200 + code=200；实测 filter-options 仅 projectList/statusList，overview 仅 bugCount/caseCount/currentDemandCount/passRate=100，story-search 为裸文本 404"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "接口全部为硬编码桩，没有可断言的持久化状态；需求质量真实算法在 keeper-one-web/aegis 后端，本仓库无法提供基准数据集。",
+        "onlineMonitoring": "对硬编码响应体做断言式巡检：若 overview 恒等于 {4,14,0,100} 则告警（说明仍是桩）；前端对 passRate==100 且 caseTotalCount==0 的组合应显式提示数据不可信。"
+      }
+    }
+  },
+  {
+    "id": "sec-6-3-notification-unread",
+    "sectionNumber": "6.3",
+    "lineStart": 49,
+    "lineEnd": 51,
+    "title": "通知未读数（GET /notification/un-read/{projectId}）",
+    "paragraphs": [
+      "NotificationUnRead 完全忽略路径参数 :projectId，函数体只有 `response.Success(c, 0)`，恒返回常量 0（实测 /notification/un-read/p-1 与 /p-2 均返回 code=200, data=0）。",
+      "router.go:139 只注册了 `/notification/un-read/:projectId`，前端 notification/constants.ts 还定义了 /notification/count、/notification/list/all/page、/notification/read/all、/notification/read/{id}，这些路径在本服务中全部未注册。",
+      "前端 notificationService.getUnReadCount 用 `res?.data ?? res ?? 0` 解析并对错误 catch(()=>0)，因此 0 会被当成合法未读数（负缓存），既不会报错也不会重试。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-6-3-notification-unread",
+      "title": "未读通知计数为常量 0，顶部角标与消息中心能力被静默禁用",
+      "riskLevel": "P2",
+      "riskTag": "功能桩/静默降级",
+      "riskDescription": "顶部导航未读角标依赖该接口，返回常量 0 使 `unReadCount > 0` 恒为 false，未读角标永不出现；即便后续写入了真实通知数据，也不会反映到 UI。多项目场景下两个 projectId 返回相同值，说明 :projectId 与用户维度都未参与计算，一旦将来接入真实计数，缺少按用户/项目收敛的逻辑会直接导致未读数错算。",
+      "impactScope": [
+        "handler.DashboardHandler.NotificationUnRead",
+        "internal/handler/dashboard.go:49-51",
+        "internal/router/router.go:139",
+        "前端 src/services/notification/service.ts getUnReadCount"
+      ],
+      "strategy": "注册 GET /notification/un-read/:projectId，分别以 p-1/p-2 请求，断言 data 为数字且随项目/用户变化（当前恒为 0 即证明是常量桩）；再用 router.SetupRouter() 断言 /notification/count 至少返回统一外壳而非 404。",
+      "verificationChecklist": [
+        "不同 projectId/不同用户的未读数需独立计算（当前完全相同）",
+        "无未读数据时返回 0 而不是 null",
+        "/notification/count、/notification/list/all/page 必须注册并返回 {code,data,message}",
+        "未读数接口需鉴权，不得以匿名身份返回他人未读数"
+      ],
+      "cases": [
+        {
+          "id": "tc-6-3-notification-unread-01",
+          "name": "TestDashFM_NotificationUnRead_AlwaysZeroIgnoringProjectParam",
+          "lang": "go",
+          "filePath": "internal/handler/dashboard_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupDashFMEA / dashFMEAEnvelope helper =====\n\nfunc TestDashFM_NotificationUnRead_AlwaysZeroIgnoringProjectParam(t *testing.T) {\n    setupDashFMEA(t)\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.GET(\"/notification/un-read/:projectId\", handler.NewDashboardHandler().NotificationUnRead)\n\n    for _, projectID := range []string{\"p-1\", \"p-2\"} {\n        w := httptest.NewRecorder()\n        r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/notification/un-read/\"+projectID, nil))\n        var env dashFMEAEnvelope\n        if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n            t.Fatalf(\"响应不是 {code,data,message} 契约结构: %v body=%s\", err, w.Body.String())\n        }\n        if env.Code != 200 {\n            t.Fatalf(\"期望 code=200，实际 %d message=%s\", env.Code, env.Message)\n        }\n        if string(env.Data) != \"0\" {\n            t.Errorf(\"项目 %s 未读数期望为数字 0（当前实现为常量桩），实际 data=%s\", projectID, env.Data)\n        }\n    }\n\n    full := router.SetupRouter()\n    w := httptest.NewRecorder()\n    full.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/notification/count\", nil))\n    if w.Code != http.StatusOK {\n        t.Errorf(\"前端 notification/constants.ts 还会调用 /notification/count，期望已注册，实际 HTTP %d body=%s\", w.Code, w.Body.String())\n    }\n}",
+          "evidence": {
+            "assertion": "断言两个不同 projectId 的 data 均为 JSON 数字 0，且 /notification/count 返回 HTTP 200",
+            "dbStateDiff": "[READ-ONLY] 无写操作（当前实现不读取任何通知表）",
+            "traceLog": "HTTP 200 + code=200 + data=0；/notification/count 实测为裸文本 404"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "仓库内没有通知相关 model/table，无法构造未读数据；该接口是显式桩，只能做契约存在性验证。",
+        "onlineMonitoring": "若线上未读数长期恒为 0 而消息中心存在未读记录，应对 notification/un-read 的返回恒定性做巡检告警。"
+      }
+    }
+  },
+  {
+    "id": "sec-7-1-menu-tree-build",
+    "sectionNumber": "7.1",
+    "lineStart": 211,
+    "lineEnd": 221,
+    "title": "菜单树构建 buildMenuTree 与全量菜单树接口 GetMenuTree",
+    "paragraphs": [
+      "buildMenuTree 用 `var result []*model.SysMenu` 声明返回值，空表/无子节点时为 nil slice，经 GetMenuTree 的 `response.Success(c, tree)`（menu.go:32-33）序列化成 `\"data\": null` 而不是 `[]`。",
+      "递归起点固定为 `buildMenuTree(items, 0)`，只保留能从 parent_id=0 连通的节点；parent_id 指向不存在 ID 的菜单、或父节点被过滤掉的整棵子树会被静默丢弃，接口既不报错也不写日志（AddMenu/UpdateMenu 都不校验 parent_id 是否存在）。",
+      "model.SysMenu.Children 带 `omitempty`（model/menu.go:17），叶子节点不输出 children 字段；前端一律用 `item.children && item.children.length > 0` 判空。",
+      "递归没有 visited 集合，扫描复杂度为 O(n^2)；当出现可达自环（例如 sql_mode 含 NO_AUTO_VALUE_ON_ZERO 时客户端提交 id=0/parentId=0，AddMenu 直接 `config.DB.Create(&m)` 落库）时 buildMenuTree 会无限递归，goroutine 栈溢出属 fatal error，gin.Default() 的 Recovery 无法 recover。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-7-1-menu-tree-build",
+      "title": "空菜单树序列化为 null 且孤儿/被过滤子树的菜单静默消失",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/静默数据丢失",
+      "riskDescription": "GET /system/menu/tree 在 sys_menu 为空时返回 code=200 + data=null，前端 SystemMenuView 走 `Array.isArray(data) ? data : []` 兜底看似安全，但 menuService.getUserMenuTree 会把非数组结果原样返回、setCachedUserMenus 之后 getCachedUserMenuByKey 递归 `item.children`，null 进入侧边栏渲染链即抛 TypeError，页面白屏；同时 parentId 写错的菜单（AddMenu 允许任意 parentId）在树中永久不可达也不可编辑，运维只能直接改库，属于静默数据丢失。极端情况下自环数据会让构建函数无限递归并终止整个进程。",
+      "impactScope": [
+        "handler.buildMenuTree",
+        "handler.MenuHandler.GetMenuTree",
+        "internal/handler/menu.go:211-221",
+        "internal/handler/menu.go:24-34",
+        "internal/model/menu.go:17 (Children omitempty)",
+        "table sys_menu"
+      ],
+      "strategy": "清空 sys_menu 后 GET /system/menu/tree，断言 data 的原始 JSON 为 `[]` 而不是 `null`；再插入一条 parent_id=999（不存在）的菜单，断言它出现在响应树中或接口返回校验错误，并回查 DB 证明该行确实存在（即数据存在但接口丢弃）。",
+      "verificationChecklist": [
+        "空结果必须序列化为 []（不能为 null）",
+        "parent_id 不存在的菜单不得静默丢弃，或写入时即拒绝",
+        "树中每个节点的 parentId 必须能在响应里找到父节点（无孤儿）",
+        "构造 id==parentId 的自环数据时接口不得无限递归/进程退出"
+      ],
+      "cases": [
+        {
+          "id": "tc-7-1-menu-tree-build-01",
+          "name": "TestMenuFM_GetMenuTree_EmptyTableMarshalsToNull",
+          "lang": "go",
+          "filePath": "internal/handler/menu_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n    \"bytes\"\n    \"encoding/json\"\n    \"net/http\"\n    \"net/http/httptest\"\n    \"os\"\n    \"testing\"\n    \"time\"\n\n    \"github.com/gin-gonic/gin\"\n    \"gorm.io/driver/mysql\"\n    \"gorm.io/gorm\"\n    \"gorm.io/gorm/logger\"\n\n    \"trueone-anubis/config\"\n    \"trueone-anubis/internal/handler\"\n    \"trueone-anubis/internal/middleware\"\n    \"trueone-anubis/internal/model\"\n)\n\ntype menuFMEAEnvelope struct {\n    Code    int             `json:\"code\"`\n    Data    json.RawMessage `json:\"data\"`\n    Message string          `json:\"message\"`\n}\n\n// menuFMEANode 对应 model.SysMenu 的树形 JSON\ntype menuFMEANode struct {\n    ID         int64           `json:\"id\"`\n    ParentID   int64           `json:\"parentId\"`\n    MenuKey    string          `json:\"menuKey\"`\n    Title      string          `json:\"title\"`\n    Permission string          `json:\"permission\"`\n    Status     string          `json:\"status\"`\n    IsHidden   int             `json:\"isHidden\"`\n    Children   []*menuFMEANode `json:\"children\"`\n}\n\n// setupMenuFMEA 使用独立库 anubis_fmea_test，并清空 sys_menu/user/operation_log\nfunc setupMenuFMEA(t *testing.T) *gorm.DB {\n    t.Helper()\n    dsn := os.Getenv(\"TEST_MYSQL_DSN\")\n    if dsn == \"\" {\n        dsn = \"root:root@tcp(127.0.0.1:3307)/\"\n    }\n    admin, err := gorm.Open(mysql.Open(dsn+\"?charset=utf8mb4&parseTime=true&loc=Local\"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})\n    if err != nil {\n        t.Skipf(\"MySQL 测试实例不可用，跳过: %v\", err)\n    }\n    if err := admin.Exec(\"CREATE DATABASE IF NOT EXISTS anubis_fmea_test DEFAULT CHARSET utf8mb4\").Error; err != nil {\n        t.Skipf(\"无法创建测试库，跳过: %v\", err)\n    }\n    db, err := gorm.Open(mysql.Open(dsn+\"anubis_fmea_test?charset=utf8mb4&parseTime=true&loc=Local\"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})\n    if err != nil {\n        t.Fatalf(\"连接测试库失败: %v\", err)\n    }\n    if err := db.AutoMigrate(&model.SysMenu{}, &model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.OperationLog{}); err != nil {\n        t.Fatalf(\"AutoMigrate 失败: %v\", err)\n    }\n    for _, m := range []interface{}{&model.SysMenu{}, &model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.OperationLog{}} {\n        if err := db.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(m).Error; err != nil {\n            t.Fatalf(\"清理测试数据失败: %v\", err)\n        }\n    }\n    config.DB = db\n    return db\n}\n\nfunc flattenMenuFMEAKeys(nodes []*menuFMEANode) []string {\n    keys := make([]string, 0, len(nodes))\n    for _, n := range nodes {\n        if n == nil {\n            continue\n        }\n        keys = append(keys, n.MenuKey)\n        keys = append(keys, flattenMenuFMEAKeys(n.Children)...)\n    }\n    return keys\n}\n\nfunc containsMenuFMEAKey(keys []string, want string) bool {\n    for _, k := range keys {\n        if k == want {\n            return true\n        }\n    }\n    return false\n}\n\nfunc TestMenuFM_GetMenuTree_EmptyTableMarshalsToNull(t *testing.T) {\n    setupMenuFMEA(t)\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.GET(\"/system/menu/tree\", handler.NewMenuHandler().GetMenuTree)\n\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/system/menu/tree\", nil))\n\n    var env menuFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"解析响应失败: %v body=%s\", err, w.Body.String())\n    }\n    if env.Code != 200 {\n        t.Fatalf(\"期望 code=200，实际 %d message=%s\", env.Code, env.Message)\n    }\n    if string(env.Data) != \"[]\" {\n        t.Errorf(\"buildMenuTree 返回 nil slice，期望 data 为 []（前端 Array.isArray/直接 .map 会崩），实际 %s\", env.Data)\n    }\n}",
+          "evidence": {
+            "assertion": "断言空 sys_menu 时 {code,data,message}.data 的原始 JSON 等于 \"[]\"",
+            "dbStateDiff": "[READ-ONLY] sys_menu 被清空后仅执行 SELECT * FROM sys_menu ORDER BY sort ASC, id ASC",
+            "traceLog": "HTTP 200 + code=200；实测当前实现返回 data=null"
+          }
+        },
+        {
+          "id": "tc-7-1-menu-tree-build-02",
+          "name": "TestMenuFM_BuildMenuTree_OrphanParentIdSilentlyDropped",
+          "lang": "go",
+          "filePath": "internal/handler/menu_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupMenuFMEA / menuFMEAEnvelope / flattenMenuFMEAKeys / containsMenuFMEAKey helper =====\n\nfunc TestMenuFM_BuildMenuTree_OrphanParentIdSilentlyDropped(t *testing.T) {\n    db := setupMenuFMEA(t)\n    if err := db.Create(&[]model.SysMenu{\n        {ID: 10, ParentID: 0, MenuKey: \"root-ok\", Title: \"正常根菜单\", Status: \"ENABLE\", MenuType: \"MENU\"},\n        {ID: 11, ParentID: 999, MenuKey: \"orphan\", Title: \"孤儿菜单\", Status: \"ENABLE\", MenuType: \"MENU\"},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.GET(\"/system/menu/tree\", handler.NewMenuHandler().GetMenuTree)\n\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/system/menu/tree\", nil))\n    var env menuFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"解析响应失败: %v body=%s\", err, w.Body.String())\n    }\n    var tree []*menuFMEANode\n    if err := json.Unmarshal(env.Data, &tree); err != nil {\n        t.Fatalf(\"data 不是菜单树数组: %v data=%s\", err, env.Data)\n    }\n    keys := flattenMenuFMEAKeys(tree)\n\n    if !containsMenuFMEAKey(keys, \"orphan\") {\n        t.Errorf(\"parentId=999 不存在的菜单被静默丢弃（期望出现在树中或写入时被拒绝），实际树 keys=%v\", keys)\n    }\n\n    var cnt int64\n    if err := db.Model(&model.SysMenu{}).Where(\"menu_key = ?\", \"orphan\").Count(&cnt).Error; err != nil {\n        t.Fatalf(\"回查失败: %v\", err)\n    }\n    if cnt != 1 {\n        t.Fatalf(\"前置条件失败：孤儿菜单应已落库，实际 %d 条\", cnt)\n    }\n    if !containsMenuFMEAKey(keys, \"root-ok\") {\n        t.Errorf(\"正常根菜单应出现在树中，实际树 keys=%v\", keys)\n    }\n}",
+          "evidence": {
+            "assertion": "断言 menu_key=orphan（parent_id=999 不存在）出现在 GET /system/menu/tree 的树节点中，且 DB 中该行确实存在",
+            "dbStateDiff": "[WRITE] INSERT INTO sys_menu (id=11, parent_id=999) 后无任何 UPDATE/DELETE，接口侧只读",
+            "traceLog": "HTTP 200 + code=200；当前实现树中只有 root-ok，orphan 静默消失"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "菜单种子数据由人工/前端写入，仓库内没有 SQL 迁移或 seed 文件，无法保证测试库与开发库的 sys_menu 一致；自环场景依赖 MySQL sql_mode，难以在测试中稳定复现。",
+        "onlineMonitoring": "对 GET /system/menu/tree 做巡检：data 为 null 或树节点数小于 SELECT COUNT(*) FROM sys_menu WHERE status='ENABLE' 时告警（提示存在孤儿/被丢弃节点）。"
+      }
+    }
+  },
+  {
+    "id": "sec-7-2-user-menu-permission",
+    "sectionNumber": "7.2",
+    "lineStart": 36,
+    "lineEnd": 92,
+    "title": "当前用户菜单树 GetUserMenuTree 的身份识别与权限过滤",
+    "paragraphs": [
+      "GetUserMenuTree 先做 `userId, exists := c.Get(\"userId\")`，缺失或为空时把 userId 兜底成字符串 \"admin\"（menu.go:38-41），匿名请求因此被当作管理员。",
+      "middleware.AuthMiddleware 在 token 未命中内存 Store 时执行 `c.Set(\"userId\", token)`，把调用方自选的任意字符串当作用户 ID；AuthService.GetCurrentUser 查不到该 ID 时回退 `config.DB.Where(\"deleted = 0\").First(&user)` 取 user 表首行（默认即 admin），GetUserPermissions 对 `userId == \"admin\"` 或存在 role_id=admin 关系者返回含 \"*\" 的全量权限。",
+      "权限校验是显式 fail-open：`if err == nil && sessionUser != nil { ... } else { isAdmin = true }`（menu.go:53-63），鉴权服务任何错误都升级为管理员视图。",
+      "权限过滤默认放行：`if m.Permission == \"\" { filtered = append(filtered, m); continue }`，而 AddMenu 只强制 MenuKey/Title（menu.go:102-105），因此不带权限码的菜单对所有用户可见；过滤后的集合再交给 buildMenuTree(filtered, 0)，父节点被 status/isHidden/权限淘汰时其后代整棵消失。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-7-2-user-menu-permission",
+      "title": "任意伪造 token 或匿名请求都能拿到管理员菜单树（鉴权绕过 + fail-open）",
+      "riskLevel": "P0",
+      "riskTag": "鉴权绕过",
+      "riskDescription": "实测对 http://127.0.0.1:8081/system/menu/user-tree 发送 X-AUTH-TOKEN: totally-bogus-token（无需任何登录态）即可获得完整菜单树，包含需要 SYSTEM:WRITE 的项；完全不发 token 同样返回完整菜单树（userId 兜底为 admin）。攻击链共三段：AuthMiddleware 把未命中会话的 token 原样写成 userId → GetCurrentUser 回退成 user 表首行（默认 admin）→ GetUserPermissions 返回 \"*\" 使 isAdmin=true。后果是低权限用户能看见并直接访问系统设置/组织管理等入口，配合各接口普遍缺少服务端鉴权（AuthMiddleware 从不 Abort）即形成完整越权；另外 GetUserMenuTree 的任何内部错误都会 fail-open 放开全部菜单。",
+      "impactScope": [
+        "handler.MenuHandler.GetUserMenuTree",
+        "service.AuthService.GetCurrentUser",
+        "service.AuthService.GetUserPermissions",
+        "middleware.AuthMiddleware",
+        "internal/handler/menu.go:36-92",
+        "internal/service/auth.go:181-219",
+        "internal/middleware/auth.go:38-68",
+        "table sys_menu, user, user_role_relation"
+      ],
+      "strategy": "造 admin（带 role_id=admin 关系）+ 低权限用户 + 一条 permission=SYSTEM:WRITE 的菜单，注册真实 middleware.AuthMiddleware() 与 GET /system/menu/user-tree；分别以 X-AUTH-TOKEN: totally-bogus-token 和完全不传 token 请求，断言响应树中不含该 SYSTEM:WRITE 菜单；再删空 user 表触发 GetCurrentUser 失败，断言接口返回错误而不是放行全部菜单。",
+      "verificationChecklist": [
+        "伪造/未知 token 必须被拒绝（HTTP 401 或 code=100401）",
+        "无 token 请求不得返回任何菜单",
+        "GetCurrentUser 失败时必须 fail-close（返回错误或空树）",
+        "permission 为空的菜单不得默认对全部用户可见",
+        "ENABLE 子菜单不得因其父节点被过滤而消失"
+      ],
+      "cases": [
+        {
+          "id": "tc-7-2-user-menu-permission-01",
+          "name": "TestMenuFM_UserMenuTree_UnknownTokenGetsAdminMenus",
+          "lang": "go",
+          "filePath": "internal/handler/menu_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupMenuFMEA / menuFMEAEnvelope / flattenMenuFMEAKeys / containsMenuFMEAKey helper =====\n\nfunc TestMenuFM_UserMenuTree_UnknownTokenGetsAdminMenus(t *testing.T) {\n    db := setupMenuFMEA(t)\n    if err := db.Create(&[]model.User{\n        {ID: \"admin\", Name: \"Administrator\", Deleted: model.BitBool(false), Enable: model.BitBool(true)},\n        {ID: \"zz-lowpriv\", Name: \"普通用户\", Deleted: model.BitBool(false), Enable: model.BitBool(true)},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n    if err := db.Create(&model.UserRoleRelation{ID: \"rel-admin\", UserID: \"admin\", RoleID: \"admin\", SourceID: \"system\"}).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n    if err := db.Create(&[]model.SysMenu{\n        {ID: 1, ParentID: 0, MenuKey: \"workspace\", Title: \"工作台\", Permission: \"WORKSPACE:READ\", Status: \"ENABLE\", MenuType: \"MENU\"},\n        {ID: 2, ParentID: 0, MenuKey: \"system-setting\", Title: \"系统设置\", Permission: \"SYSTEM:WRITE\", Status: \"ENABLE\", MenuType: \"MENU\"},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.Use(middleware.AuthMiddleware())\n    r.GET(\"/system/menu/user-tree\", handler.NewMenuHandler().GetUserMenuTree)\n\n    cases := []struct {\n        name  string\n        token string\n    }{\n        {name: \"伪造任意 token\", token: \"totally-bogus-token\"},\n        {name: \"完全不携带 token\", token: \"\"},\n    }\n    for _, tc := range cases {\n        req := httptest.NewRequest(http.MethodGet, \"/system/menu/user-tree\", nil)\n        if tc.token != \"\" {\n            req.Header.Set(\"X-AUTH-TOKEN\", tc.token)\n        }\n        w := httptest.NewRecorder()\n        r.ServeHTTP(w, req)\n\n        var env menuFMEAEnvelope\n        if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n            t.Fatalf(\"[%s] 响应不是 {code,data,message} 契约结构: %v body=%s\", tc.name, err, w.Body.String())\n        }\n        if env.Code == 200 && string(env.Data) != \"[]\" {\n            var tree []*menuFMEANode\n            if err := json.Unmarshal(env.Data, &tree); err != nil {\n                t.Fatalf(\"[%s] data 不是菜单树: %v data=%s\", tc.name, err, env.Data)\n            }\n            if containsMenuFMEAKey(flattenMenuFMEAKeys(tree), \"system-setting\") {\n                t.Errorf(\"[%s] 匿名/伪造凭据获得了需要 SYSTEM:WRITE 的菜单（鉴权绕过），实际树 keys=%v\", tc.name, flattenMenuFMEAKeys(tree))\n            }\n        }\n    }\n}",
+          "evidence": {
+            "assertion": "断言 X-AUTH-TOKEN: totally-bogus-token 与无 token 两种请求的菜单树中都不含 menu_key=system-setting（permission=SYSTEM:WRITE）",
+            "dbStateDiff": "[READ-ONLY] 接口仅 SELECT user/user_role_relation/sys_menu，无写操作",
+            "traceLog": "HTTP 200 + code=200；实测两种请求都返回完整菜单树（含 SYSTEM:WRITE 项）"
+          }
+        },
+        {
+          "id": "tc-7-2-user-menu-permission-02",
+          "name": "TestMenuFM_UserMenuTree_EnabledChildUnderDisabledParentVanishes",
+          "lang": "go",
+          "filePath": "internal/handler/menu_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 helper =====\n\nfunc TestMenuFM_UserMenuTree_EnabledChildUnderDisabledParentVanishes(t *testing.T) {\n    db := setupMenuFMEA(t) // 故意不造任何用户：GetCurrentUser 失败会走 isAdmin=true 的 fail-open 分支\n    now := time.Now().UnixMilli()\n    if err := db.Create(&[]model.SysMenu{\n        {ID: 20, ParentID: 0, MenuKey: \"l1\", Title: \"一级\", Status: \"ENABLE\", MenuType: \"MENU\", CreateTime: now, UpdateTime: now},\n        {ID: 21, ParentID: 20, MenuKey: \"l2-disabled\", Title: \"二级停用\", Status: \"DISABLE\", MenuType: \"DIRECTORY\", CreateTime: now, UpdateTime: now},\n        {ID: 22, ParentID: 21, MenuKey: \"l3-enabled\", Title: \"三级启用\", Status: \"ENABLE\", MenuType: \"MENU\", CreateTime: now, UpdateTime: now},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.GET(\"/system/menu/user-tree\", handler.NewMenuHandler().GetUserMenuTree)\n\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/system/menu/user-tree\", nil))\n    var env menuFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"解析响应失败: %v body=%s\", err, w.Body.String())\n    }\n\n    var cnt int64\n    if err := db.Model(&model.SysMenu{}).Where(\"status = ?\", \"ENABLE\").Count(&cnt).Error; err != nil {\n        t.Fatalf(\"回查失败: %v\", err)\n    }\n    if cnt != 2 {\n        t.Fatalf(\"前置条件失败：应存在 2 个 ENABLE 菜单，实际 %d\", cnt)\n    }\n\n    var tree []*menuFMEANode\n    if err := json.Unmarshal(env.Data, &tree); err != nil {\n        t.Fatalf(\"data 不是菜单树: %v data=%s\", err, env.Data)\n    }\n    keys := flattenMenuFMEAKeys(tree)\n    if !containsMenuFMEAKey(keys, \"l3-enabled\") {\n        t.Errorf(\"ENABLE 的三级菜单因父节点 DISABLE 被 buildMenuTree 静默丢弃（期望其仍可达或至少返回告警），实际树 keys=%v\", keys)\n    }\n    if !containsMenuFMEAKey(keys, \"l1\") {\n        t.Errorf(\"一级 ENABLE 菜单应出现在树中，实际树 keys=%v\", keys)\n    }\n}",
+          "evidence": {
+            "assertion": "断言 status=ENABLE 的 menu_key=l3-enabled 出现在用户菜单树中（其父 l2-disabled 为 DISABLE），并回查 DB 确认有 2 个 ENABLE 菜单",
+            "dbStateDiff": "[WRITE] 仅 INSERT 3 行 sys_menu，接口侧只读",
+            "traceLog": "HTTP 200 + code=200；当前实现树中只有 l1，l3-enabled 整棵消失"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "全局 AuthMiddleware 不 Abort，无法在单测里通过路由中间件断言 401；menu_key 的权限码语义（如 SYSTEM:WRITE 是否等价于菜单可见）由外部老系统定义，缺少权威权限矩阵。",
+        "onlineMonitoring": "统计 /system/menu/user-tree 的匿名调用量与返回节点数；同一用户返回的菜单集合应与 user_role_permission 计算出的权限集合交互相符，出现超集即告警。"
+      }
+    }
+  },
+  {
+    "id": "sec-7-3-menu-crud",
+    "sectionNumber": "7.3",
+    "lineStart": 94,
+    "lineEnd": 209,
+    "title": "菜单增删改 AddMenu / UpdateMenu / DeleteMenu",
+    "paragraphs": [
+      "UpdateMenu 是整体覆盖：`existing.ParentID/Title/Path/Icon/Permission/MenuType/Sort/IsHidden/Status = m.*` 全部用请求体零值赋值，`config.DB.Save(&existing)` 在主键非零时会更新全部字段；只有 MenuKey 在非空且与库中不同时才更新。",
+      "AddMenu 有默认值兜底（Status=ENABLE、MenuType=MENU、Icon=Globe，menu.go:117-125），UpdateMenu 没有，因此局部提交会把 status 写成空串，菜单因 `Where(\"status = ?\", \"ENABLE\")` 从用户菜单树中消失。",
+      "AddMenu 用 `Where(\"menu_key = ?\", m.MenuKey).Count(&count)` 预检唯一性（存在 TOCTOU 竞态），不校验 ParentID 是否存在或成环，SQL 错误直接 `response.Fail(c, 500, err.Error())` 回显。",
+      "DeleteMenu 只用 `Where(\"parent_id = ?\", id).Count(&childCount)` 阻止删除有子节点的菜单；`config.DB.First(&m, id)` 失败时静默跳过删除与审计并返回 `response.Success(c, \"删除成功\")`；成功路径的审计是 `service.RecordAuditLog(...)` 异步 `go func()` 写 operation_log，写入失败被 recover 吞掉（audit.go:70-92）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-7-3-menu-crud",
+      "title": "菜单更新按整体覆盖语义处理局部请求导致 status/permission 被置零，删除不存在记录假成功且缺审计",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/审计缺失",
+      "riskDescription": "任何按 PATCH 语义调用 /system/menu/update 的客户端（只提交 id + 待改字段）都会把 Path/Icon/Permission/MenuType/Status 一次性清零：status 变为空串后该菜单立刻从 /system/menu/user-tree 消失（前端侧栏菜单凭空少一项），permission 变为空串后又会命中「无权限码即对所有人可见」的默认放行分支，形成一次写操作同时造成功能丢失与越权暴露。DeleteMenu 对不存在的 id 返回 code=200 + \"删除成功\" 且不写 operation_log，管理员误以为删除成功，审计链断裂；AddMenu 不校验 parentId 会持续制造孤儿菜单，DB 报错原文（表名/约束名）被直接回显到前端。",
+      "impactScope": [
+        "handler.MenuHandler.AddMenu",
+        "handler.MenuHandler.UpdateMenu",
+        "handler.MenuHandler.DeleteMenu",
+        "service.RecordAuditLog",
+        "internal/handler/menu.go:94-209",
+        "internal/service/audit.go:31-92",
+        "table sys_menu, operation_log"
+      ],
+      "strategy": "先造一条 status=ENABLE/permission=SYSTEM:READ 的菜单，再以仅含 id/menuKey/title 的 body 调 POST /system/menu/update，断言 DB 中 status 仍为 ENABLE、permission 未被清空，且 GET /system/menu/user-tree 仍包含该菜单；再 POST /system/menu/add（parentId=987654）断言被拒绝或校验报错；最后 GET /system/menu/delete/424242 断言 code!=200，或断言 operation_log 出现对应 DELETE 审计（轮询等待异步 goroutine）。",
+      "verificationChecklist": [
+        "局部更新不得清空未提交字段（status/permission/path/menuType）",
+        "更新后的菜单必须仍在 /system/menu/user-tree 中可见",
+        "AddMenu 必须拒绝不存在的 parentId（或返回校验错误）",
+        "删除不存在的菜单必须返回失败码，且成功删除必须写 operation_log",
+        "500 响应不得回显 MySQL 原始错误文本"
+      ],
+      "cases": [
+        {
+          "id": "tc-7-3-menu-crud-01",
+          "name": "TestMenuFM_UpdateMenu_PartialBodyZeroesStatusAndHidesMenu",
+          "lang": "go",
+          "filePath": "internal/handler/menu_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupMenuFMEA / menuFMEAEnvelope / flattenMenuFMEAKeys / containsMenuFMEAKey helper =====\n\nfunc TestMenuFM_UpdateMenu_PartialBodyZeroesStatusAndHidesMenu(t *testing.T) {\n    db := setupMenuFMEA(t)\n    if err := db.Create(&model.SysMenu{\n        ID: 1, ParentID: 0, MenuKey: \"setting\", Title: \"系统设置\", Path: \"/setting\",\n        Icon: \"Settings\", Permission: \"SYSTEM:READ\", MenuType: \"MENU\", Sort: 99, Status: \"ENABLE\",\n        CreateTime: time.Now().UnixMilli(), UpdateTime: time.Now().UnixMilli(),\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.POST(\"/system/menu/update\", handler.NewMenuHandler().UpdateMenu)\n    r.GET(\"/system/menu/user-tree\", handler.NewMenuHandler().GetUserMenuTree)\n\n    req := httptest.NewRequest(http.MethodPost, \"/system/menu/update\", bytes.NewBufferString(`{\"id\":1,\"menuKey\":\"setting\",\"title\":\"系统设置V2\"}`))\n    req.Header.Set(\"Content-Type\", \"application/json\")\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, req)\n\n    var env menuFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"解析响应失败: %v body=%s\", err, w.Body.String())\n    }\n    if env.Code != 200 {\n        t.Fatalf(\"期望 code=200，实际 %d message=%s\", env.Code, env.Message)\n    }\n\n    var after model.SysMenu\n    if err := db.First(&after, 1).Error; err != nil {\n        t.Fatalf(\"回查菜单失败: %v\", err)\n    }\n    if after.Status != \"ENABLE\" {\n        t.Errorf(\"局部更新把 status 覆盖为零值 %q（期望保留 ENABLE），该菜单会从用户菜单树消失\", after.Status)\n    }\n    if after.Permission != \"SYSTEM:READ\" {\n        t.Errorf(\"局部更新把 permission 覆盖为零值 %q（期望保留 SYSTEM:READ）\", after.Permission)\n    }\n\n    w2 := httptest.NewRecorder()\n    r.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/system/menu/user-tree\", nil))\n    var env2 menuFMEAEnvelope\n    if err := json.Unmarshal(w2.Body.Bytes(), &env2); err != nil {\n        t.Fatalf(\"解析 user-tree 失败: %v body=%s\", err, w2.Body.String())\n    }\n    var tree []*menuFMEANode\n    _ = json.Unmarshal(env2.Data, &tree)\n    if !containsMenuFMEAKey(flattenMenuFMEAKeys(tree), \"setting\") {\n        t.Errorf(\"更新后菜单从用户菜单树消失（status 被置空），实际树 keys=%v\", flattenMenuFMEAKeys(tree))\n    }\n}",
+          "evidence": {
+            "assertion": "断言 UPDATE 后 sys_menu.status 仍为 'ENABLE'、permission 仍为 'SYSTEM:READ'，且 GET /system/menu/user-tree 仍含 menu_key=setting",
+            "dbStateDiff": "[WRITE] UPDATE sys_menu SET parent_id=0,title='系统设置V2',path='',icon='',permission='',menu_type='',sort=0,is_hidden=0,status='' WHERE id=1（当前实现）；期望仅更新提交字段",
+            "traceLog": "HTTP 200 + code=200 + message=success；当前实现 status 为空串，菜单从用户树消失"
+          }
+        },
+        {
+          "id": "tc-7-3-menu-crud-02",
+          "name": "TestMenuFM_AddMenuAndDeleteMenu_NoParentValidationAndNoAuditOnMissingRow",
+          "lang": "go",
+          "filePath": "internal/handler/menu_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupMenuFMEA / menuFMEAEnvelope helper =====\n\nfunc countMenuFMEAAudit(t *testing.T, db *gorm.DB, opType string) int64 {\n    t.Helper()\n    var n int64\n    if err := db.Model(&model.OperationLog{}).Where(\"module = ? AND type = ?\", \"SYSTEM\", opType).Count(&n).Error; err != nil {\n        t.Fatalf(\"统计审计日志失败: %v\", err)\n    }\n    return n\n}\n\nfunc TestMenuFM_AddMenuAndDeleteMenu_NoParentValidationAndNoAuditOnMissingRow(t *testing.T) {\n    db := setupMenuFMEA(t)\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    h := handler.NewMenuHandler()\n    r.POST(\"/system/menu/add\", h.AddMenu)\n    r.GET(\"/system/menu/delete/:id\", h.DeleteMenu)\n\n    req := httptest.NewRequest(http.MethodPost, \"/system/menu/add\", bytes.NewBufferString(`{\"menuKey\":\"ghost\",\"title\":\"幽灵菜单\",\"parentId\":987654,\"status\":\"ENABLE\",\"menuType\":\"MENU\"}`))\n    req.Header.Set(\"Content-Type\", \"application/json\")\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, req)\n\n    var env menuFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"解析响应失败: %v body=%s\", err, w.Body.String())\n    }\n    if env.Code == 200 {\n        var ghost model.SysMenu\n        if err := db.Where(\"menu_key = ?\", \"ghost\").First(&ghost).Error; err == nil {\n            t.Errorf(\"AddMenu 接受不存在的 parentId=987654 并落库（id=%d），该菜单在 buildMenuTree(items,0) 中永远不可达\", ghost.ID)\n        }\n    }\n\n    time.Sleep(300 * time.Millisecond)\n    before := countMenuFMEAAudit(t, db, \"DELETE\")\n\n    w2 := httptest.NewRecorder()\n    r.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/system/menu/delete/424242\", nil))\n    var env2 menuFMEAEnvelope\n    if err := json.Unmarshal(w2.Body.Bytes(), &env2); err != nil {\n        t.Fatalf(\"解析删除响应失败: %v body=%s\", err, w2.Body.String())\n    }\n\n    time.Sleep(300 * time.Millisecond)\n    after := countMenuFMEAAudit(t, db, \"DELETE\")\n\n    if env2.Code == 200 {\n        t.Errorf(\"删除不存在的菜单 id=424242 返回 code=200 message=%q（假成功）\", env2.Message)\n    }\n    if after == before {\n        t.Errorf(\"删除操作未写入 operation_log（审计缺失）：DELETE 审计条数仍为 %d\", after)\n    }\n}",
+          "evidence": {
+            "assertion": "断言 AddMenu 拒绝 parentId=987654（或返回校验错误）、DeleteMenu 对不存在 id 返回 code!=200 且 operation_log 出现 module=SYSTEM/type=DELETE 记录",
+            "dbStateDiff": "[WRITE] 期望 INSERT sys_menu 被拒绝；DELETE 审计应新增 1 行 operation_log(module='SYSTEM', type='DELETE', source_id='424242')",
+            "traceLog": "HTTP 200 + code=200 + message='success'，data='删除成功'；实测 operation_log 无新增行（DELETE 审计条数 0）"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "audit 走 `go func()` 异步写库，断言需要轮询/等待，存在 flake 风险；RecordAuditLog 的默认 org/proj 兜底（ORGANIZATION 缺省 100001、SYSTEM 模块强制 SYSTEM）依赖请求头，单测无法覆盖真实多租户组合。",
+        "onlineMonitoring": "对 operation_log 的写入速率做基线告警：菜单/机器人/消息等写接口的 200 响应数 与 operation_log 新增行数出现偏差即告警（审计缺失）。"
+      }
+    }
+  },
+  {
+    "id": "sec-8-1-message-task-template",
+    "sectionNumber": "8.1",
+    "lineStart": 19,
+    "lineEnd": 54,
+    "title": "消息任务配置与消息模板（/notice/message/*、/notice/template/*）",
+    "paragraphs": [
+      "MessageList/MessageFields 返回 `[]interface{}{}`，MessageDetail 返回 `gin.H{}`，MessageSave 返回字符串 \"保存成功\"（message.go:19-54），四者都不读库也不写库，仓库内也没有任何消息相关 model/table。",
+      "前端 useMessageTemplate 读取 `data.subject/data.template/data.defaultSubject/data.defaultTemplate` 与 `data.fieldList`，与 `{}`/`[]` 均不匹配：模板编辑器内容为空、变量插入列表永远为空。",
+      "MessageUserList 忽略前端传入的 keyword 查询参数（以及路径上的 projectId），直接 `config.DB.Where(\"deleted = 0\").Find(&users)` 返回 user 全表的 id/name/email。",
+      "路由与前端真实 URL 不一致：project-management.ts 调用 GET /notice/message/task/get/user/{projectId}、GET /notice/message/template/detail/{projectId}、GET /notice/template/get/fields/{projectId}，而 router.go:218-222 只注册了不带路径参数的版本，三者实测均返回 gin 裸文本 `404 page not found`（HTTP 404，非 {code,data,message} 外壳）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-8-1-message-task-template",
+      "title": "消息配置接口为纯内存桩且三处前端 URL 未注册导致 404 裸文本",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/功能桩",
+      "riskDescription": "消息配置页面（ProjectMessageView / useMessageTemplate）会依次调用这三个带 projectId 的 GET，全部命中 404 且响应体是 gin 默认文本，前端 axios 拦截器判断 `error.response.data?.message` 得到 undefined，最终抛出的是通用网络错误而非可读业务错误；即便请求到已注册的无参版本，返回的 `{}`/`[]` 也让模板编辑器空白、变量列表为空。POST /notice/message/task/save 返回 \"保存成功\" 但完全不落库、不写审计，用户以为保存成功，刷新后配置丢失（假成功），这也是最容易被误判为「功能正常」的 mock 缺陷。",
+      "impactScope": [
+        "handler.MessageHandler.MessageList",
+        "handler.MessageHandler.MessageSave",
+        "handler.MessageHandler.MessageDetail",
+        "handler.MessageHandler.MessageFields",
+        "handler.MessageHandler.MessageUserList",
+        "internal/handler/message.go:19-54",
+        "internal/router/router.go:217-222",
+        "table user"
+      ],
+      "strategy": "注册 POST /notice/message/task/save 与 GET /notice/message/task/get/user；调用 save 后断言 operation_log 至少新增 1 行（当前为 0，审计缺失）；调用 user 列表并带上 keyword=不存在的关键字，断言返回集为空（当前返回全表并包含邮箱）。再用 router.SetupRouter() 断言前端三个带 projectId 的 URL 返回 HTTP 200 且响应体是合法 JSON 外壳。",
+      "verificationChecklist": [
+        "GET /notice/message/task/get/user/{projectId} 必须注册并返回统一外壳",
+        "GET /notice/message/template/detail/{projectId} 必须返回 subject/template/defaultSubject/defaultTemplate",
+        "GET /notice/template/get/fields/{projectId} 必须返回 {fieldList: [...]}",
+        "POST /notice/message/task/save 必须落库并写 operation_log",
+        "用户候选接口必须按 keyword 过滤且不得无鉴权暴露邮箱"
+      ],
+      "cases": [
+        {
+          "id": "tc-8-1-message-task-template-01",
+          "name": "TestMsgFM_MessageTaskSaveStubAndUserListLeaksEmails",
+          "lang": "go",
+          "filePath": "internal/handler/message_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n    \"bytes\"\n    \"encoding/json\"\n    \"net/http\"\n    \"net/http/httptest\"\n    \"os\"\n    \"testing\"\n    \"time\"\n\n    \"github.com/gin-gonic/gin\"\n    \"gorm.io/driver/mysql\"\n    \"gorm.io/gorm\"\n    \"gorm.io/gorm/logger\"\n\n    \"trueone-anubis/config\"\n    \"trueone-anubis/internal/handler\"\n    \"trueone-anubis/internal/model\"\n    \"trueone-anubis/internal/router\"\n)\n\ntype msgFMEAEnvelope struct {\n    Code    int             `json:\"code\"`\n    Data    json.RawMessage `json:\"data\"`\n    Message string          `json:\"message\"`\n}\n\n// setupMsgFMEA 使用独立库 anubis_fmea_test\nfunc setupMsgFMEA(t *testing.T) *gorm.DB {\n    t.Helper()\n    dsn := os.Getenv(\"TEST_MYSQL_DSN\")\n    if dsn == \"\" {\n        dsn = \"root:root@tcp(127.0.0.1:3307)/\"\n    }\n    admin, err := gorm.Open(mysql.Open(dsn+\"?charset=utf8mb4&parseTime=true&loc=Local\"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})\n    if err != nil {\n        t.Skipf(\"MySQL 测试实例不可用，跳过: %v\", err)\n    }\n    if err := admin.Exec(\"CREATE DATABASE IF NOT EXISTS anubis_fmea_test DEFAULT CHARSET utf8mb4\").Error; err != nil {\n        t.Skipf(\"无法创建测试库，跳过: %v\", err)\n    }\n    db, err := gorm.Open(mysql.Open(dsn+\"anubis_fmea_test?charset=utf8mb4&parseTime=true&loc=Local\"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})\n    if err != nil {\n        t.Fatalf(\"连接测试库失败: %v\", err)\n    }\n    if err := db.AutoMigrate(&model.User{}, &model.OperationLog{}); err != nil {\n        t.Fatalf(\"AutoMigrate 失败: %v\", err)\n    }\n    for _, m := range []interface{}{&model.User{}, &model.OperationLog{}} {\n        if err := db.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(m).Error; err != nil {\n            t.Fatalf(\"清理测试数据失败: %v\", err)\n        }\n    }\n    config.DB = db\n    return db\n}\n\nfunc countMsgFMEAAudit(t *testing.T, db *gorm.DB) int64 {\n    t.Helper()\n    var n int64\n    if err := db.Model(&model.OperationLog{}).Count(&n).Error; err != nil {\n        t.Fatalf(\"统计审计日志失败: %v\", err)\n    }\n    return n\n}\n\nfunc TestMsgFM_MessageTaskSaveStubAndUserListLeaksEmails(t *testing.T) {\n    db := setupMsgFMEA(t)\n    if err := db.Create(&model.User{ID: \"u-1\", Name: \"张三\", Email: \"zhangsan@corp.com\", Deleted: model.BitBool(false)}).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    h := handler.NewMessageHandler()\n    r.POST(\"/notice/message/task/save\", h.MessageSave)\n    r.GET(\"/notice/message/task/get/user\", h.MessageUserList)\n\n    req := httptest.NewRequest(http.MethodPost, \"/notice/message/task/save\", bytes.NewBufferString(`{\"projectId\":\"p-1\",\"taskType\":\"CASE\",\"events\":[\"EXECUTE_SUCCESS\"]}`))\n    req.Header.Set(\"Content-Type\", \"application/json\")\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, req)\n\n    var env msgFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"响应不是 {code,data,message} 契约结构: %v body=%s\", err, w.Body.String())\n    }\n    if env.Code != 200 {\n        t.Fatalf(\"期望 code=200，实际 %d message=%s\", env.Code, env.Message)\n    }\n\n    time.Sleep(300 * time.Millisecond)\n    if n := countMsgFMEAAudit(t, db); n == 0 {\n        t.Errorf(\"消息配置保存未写入 operation_log（审计缺失），且无任何持久化表，为假成功\")\n    }\n\n    w2 := httptest.NewRecorder()\n    r.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/notice/message/task/get/user?keyword=不存在的关键字\", nil))\n    var env2 msgFMEAEnvelope\n    if err := json.Unmarshal(w2.Body.Bytes(), &env2); err != nil {\n        t.Fatalf(\"解析 user 列表响应失败: %v body=%s\", err, w2.Body.String())\n    }\n    if bytes.Contains(env2.Data, []byte(\"zhangsan@corp.com\")) {\n        t.Errorf(\"用户候选接口未按 keyword 过滤且无鉴权即返回邮箱（PII 泄露），data=%s\", env2.Data)\n    }\n}",
+          "evidence": {
+            "assertion": "断言 POST /notice/message/task/save 后 operation_log 至少 1 行；断言 keyword=不存在的关键字 的响应中不含 zhangsan@corp.com",
+            "dbStateDiff": "[WRITE] 期望 INSERT 消息任务配置表 + INSERT operation_log(module='SYSTEM', type='UPDATE'/'ADD')；实测 operation_log 新增 0 行",
+            "traceLog": "HTTP 200 + code=200 + data='保存成功'；实测 user 列表返回全表含邮箱"
+          }
+        },
+        {
+          "id": "tc-8-1-message-task-template-02",
+          "name": "TestMsgFM_MessageTemplateRoutes_MissingComparedToFrontendContract",
+          "lang": "go",
+          "filePath": "internal/handler/message_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupMsgFMEA / msgFMEAEnvelope helper =====\n\nfunc TestMsgFM_MessageTemplateRoutes_MissingComparedToFrontendContract(t *testing.T) {\n    setupMsgFMEA(t)\n    gin.SetMode(gin.TestMode)\n    full := router.SetupRouter()\n\n    // 均为前端 project-management.ts / useMessageTemplate.ts 真实调用的 URL\n    urls := []string{\n        \"/notice/message/task/get/user/100001100001\",\n        \"/notice/message/template/detail/100001100001\",\n        \"/notice/template/get/fields/100001100001\",\n    }\n    for _, u := range urls {\n        w := httptest.NewRecorder()\n        full.ServeHTTP(w, httptest.NewRequest(http.MethodGet, u, nil))\n        if w.Code != http.StatusOK {\n            t.Errorf(\"GET %s 期望 HTTP 200 + {code,data,message} 外壳，实际 HTTP %d body=%s\", u, w.Code, w.Body.String())\n        }\n        if !json.Valid(w.Body.Bytes()) {\n            t.Errorf(\"GET %s 返回非 JSON（破坏统一响应外壳），body=%s\", u, w.Body.String())\n        }\n    }\n}",
+          "evidence": {
+            "assertion": "断言三个带 projectId 的 GET 均返回 HTTP 200 且响应体可被 json.Valid 解析",
+            "dbStateDiff": "[READ-ONLY] 期望无写操作",
+            "traceLog": "实测三者均为 HTTP 404 + body='404 page not found'（非 JSON）"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "消息配置与模板没有对应 model/table，无法断言持久化内容；真实字段契约（subject/defaultSubject/fieldList）来自老系统 aegis-next-server，本仓库无契约快照。",
+        "onlineMonitoring": "对 /notice/* 的 404 率建立告警（>0 即表示前端调用了未实现路径）；保存类接口的 200 响应必须有对应 operation_log 落库。"
+      }
+    }
+  },
+  {
+    "id": "sec-8-2-robot-crud",
+    "sectionNumber": "8.2",
+    "lineStart": 56,
+    "lineEnd": 82,
+    "title": "机器人 CRUD 与启停（/project/robot/*）",
+    "paragraphs": [
+      "RobotList 恒返回 `[]interface{}{}`；RobotAdd 用 `c.ShouldBindJSON(&body)`（忽略错误）后以 `body == nil` 兜底，注入 `body[\"id\"] = uuid.New().String()` 与 `body[\"createdAt\"] = time.Now().UnixMilli()` 后原样回显（message.go:61-70），不落库。",
+      "RobotUpdate/RobotDelete/RobotToggle 直接返回字符串 \"更新成功\"/\"删除成功\"，同样不落库、不校验 id 是否存在。",
+      "五个写操作（含 MessageSave）都没有调用 service.RecordAuditLog，违反「mutation 必写审计」契约，operation_log 无任何机器人变更记录（实测 POST /project/robot/add 后 operation_log 无新增，随即 GET /project/robot/list/{projectId} 返回空数组）。",
+      "前端 robotService.toggleRobot 调 GET /project/robot/enable/{id}，router.go:230 只注册了 POST /project/robot/enable（无 :id）；getRobotDetail 调 GET /project/robot/{id} 也未注册，实测两者均为 gin 裸文本 404。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-8-2-robot-crud",
+      "title": "机器人增删改返回伪造 id 的假成功、零持久化且无审计，启停路由与前端不匹配",
+      "riskLevel": "P0",
+      "riskTag": "审计缺失/假成功",
+      "riskDescription": "RobotAdd 用 uuid.New() 伪造 id 与 createdAt 并回显，前端把该对象插入本地列表，用户看到机器人「创建成功」；一旦刷新或再次拉取 /project/robot/list/{projectId} 却返回 []，数据凭空消失且无任何错误提示——这是 mock 后端最危险的一类缺陷，测试与联调都会被假成功掩盖。所有机器人写操作均无 operation_log，运维侧无法回答「谁在什么时候改了机器人配置」；同时启停用的 GET /project/robot/enable/{id} 未注册，点击启停按钮直接 404，且响应体是 gin 裸文本而非 {code,data,message}，前端错误处理拿到 undefined 消息，只能提示通用网络错误。",
+      "impactScope": [
+        "handler.MessageHandler.RobotList",
+        "handler.MessageHandler.RobotAdd",
+        "handler.MessageHandler.RobotUpdate",
+        "handler.MessageHandler.RobotDelete",
+        "handler.MessageHandler.RobotToggle",
+        "internal/handler/message.go:56-82",
+        "internal/router/router.go:224-230",
+        "table operation_log（缺失写入）"
+      ],
+      "strategy": "注册 POST /project/robot/add 与 GET /project/robot/list/:projectId；断言 add 返回的 id 非空且 createdAt 为毫秒量级；断言随后 list 的 data 包含该 id（当前为 []）；断言 operation_log 新增至少 1 行；再用 router.SetupRouter() 断言 GET /project/robot/enable/{id} 与 GET /project/robot/{id} 返回 HTTP 200 + JSON 外壳。",
+      "verificationChecklist": [
+        "add 返回的 id 必须能在 list 中查到（写后可读）",
+        "createdAt 必须是毫秒时间戳（UnixMilli），前端按毫秒解析",
+        "每个机器人写操作必须写 operation_log",
+        "GET /project/robot/enable/{id} 与 GET /project/robot/{id} 必须注册",
+        "delete/update 不存在的 id 必须返回失败码而非成功"
+      ],
+      "cases": [
+        {
+          "id": "tc-8-2-robot-crud-01",
+          "name": "TestMsgFM_RobotAdd_ReturnsFabricatedIDWithoutPersistingOrAuditing",
+          "lang": "go",
+          "filePath": "internal/handler/message_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupMsgFMEA / msgFMEAEnvelope / countMsgFMEAAudit helper =====\n\nfunc TestMsgFM_RobotAdd_ReturnsFabricatedIDWithoutPersistingOrAuditing(t *testing.T) {\n    db := setupMsgFMEA(t)\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    h := handler.NewMessageHandler()\n    r.POST(\"/project/robot/add\", h.RobotAdd)\n    r.GET(\"/project/robot/list/:projectId\", h.RobotList)\n\n    req := httptest.NewRequest(http.MethodPost, \"/project/robot/add\", bytes.NewBufferString(`{\"name\":\"回归机器人\",\"webhook\":\"https://example.com/hook\"}`))\n    req.Header.Set(\"Content-Type\", \"application/json\")\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, req)\n\n    var env msgFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"响应不是 {code,data,message} 契约结构: %v body=%s\", err, w.Body.String())\n    }\n    if env.Code != 200 {\n        t.Fatalf(\"期望 code=200，实际 %d message=%s\", env.Code, env.Message)\n    }\n    var created map[string]interface{}\n    if err := json.Unmarshal(env.Data, &created); err != nil {\n        t.Fatalf(\"data 不是对象: %v data=%s\", err, env.Data)\n    }\n    id, _ := created[\"id\"].(string)\n    if id == \"\" {\n        t.Fatalf(\"期望返回机器人 id，实际 data=%s\", env.Data)\n    }\n    ts, _ := created[\"createdAt\"].(float64)\n    if ts < 1e12 {\n        t.Errorf(\"createdAt 期望毫秒时间戳(≈1.7e12)，实际 %v（前端按秒解析会得到 1970 年）\", created[\"createdAt\"])\n    }\n\n    w2 := httptest.NewRecorder()\n    r.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/project/robot/list/p-1\", nil))\n    var env2 msgFMEAEnvelope\n    if err := json.Unmarshal(w2.Body.Bytes(), &env2); err != nil {\n        t.Fatalf(\"解析 list 响应失败: %v body=%s\", err, w2.Body.String())\n    }\n    if !bytes.Contains(env2.Data, []byte(id)) {\n        t.Errorf(\"新建机器人 %s 未出现在 list 中（写后不可读，刷新即丢数据），实际 list=%s\", id, env2.Data)\n    }\n\n    time.Sleep(300 * time.Millisecond)\n    if n := countMsgFMEAAudit(t, db); n == 0 {\n        t.Errorf(\"机器人新增未写入 operation_log（审计缺失），且无任何机器人持久化表\")\n    }\n}",
+          "evidence": {
+            "assertion": "断言 add 返回非空 id 且 createdAt>=1e12；断言 GET /project/robot/list/p-1 的 data 含该 id；断言 operation_log 至少 1 行",
+            "dbStateDiff": "[WRITE] 期望 INSERT 机器人表 + INSERT operation_log；实测两表均无写入",
+            "traceLog": "HTTP 200 + code=200，data={createdAt:1790656418464,id:<uuid>,name:...}；随后 list 返回 data=[]"
+          }
+        },
+        {
+          "id": "tc-8-2-robot-crud-02",
+          "name": "TestMsgFM_RobotRoutes_MissingComparedToFrontendContract",
+          "lang": "go",
+          "filePath": "internal/handler/message_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupMsgFMEA / msgFMEAEnvelope helper =====\n\nfunc TestMsgFM_RobotRoutes_MissingComparedToFrontendContract(t *testing.T) {\n    setupMsgFMEA(t)\n    gin.SetMode(gin.TestMode)\n    full := router.SetupRouter()\n\n    // robotService.toggleRobot / project-management.ts getRobotDetail 的真实 URL\n    urls := []string{\n        \"/project/robot/enable/robot-1\",\n        \"/project/robot/robot-1\",\n    }\n    for _, u := range urls {\n        w := httptest.NewRecorder()\n        full.ServeHTTP(w, httptest.NewRequest(http.MethodGet, u, nil))\n        if w.Code != http.StatusOK {\n            t.Errorf(\"GET %s 期望 HTTP 200 + {code,data,message} 外壳，实际 HTTP %d body=%s\", u, w.Code, w.Body.String())\n        }\n        if !json.Valid(w.Body.Bytes()) {\n            t.Errorf(\"GET %s 返回非 JSON（破坏统一响应外壳），body=%s\", u, w.Body.String())\n        }\n    }\n}",
+          "evidence": {
+            "assertion": "断言 GET /project/robot/enable/robot-1 与 GET /project/robot/robot-1 均返回 HTTP 200 且响应体为合法 JSON",
+            "dbStateDiff": "[READ-ONLY] 期望无写操作",
+            "traceLog": "实测两者 HTTP 404 + body='404 page not found'"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "机器人没有对应 model/table，无法断言落库内容；老系统 /project/robot/* 的字段契约（webhook 类型、enable 语义）缺少权威文档。",
+        "onlineMonitoring": "监控 /project/robot/* 的 404 率与写接口 200 响应数同 operation_log 增量的差值；前端对 add 成功的响应应回查一次 list 做一致性校验。"
+      }
+    }
+  },
+  {
+    "id": "sec-9-1-system-log-tenant-scope",
+    "sectionNumber": "9.1",
+    "lineStart": 162,
+    "lineEnd": 165,
+    "title": "系统操作日志查询（POST /operation/log/list）的租户作用域",
+    "paragraphs": [
+      "SystemLogList 以 `h.queryLogs(c, \"\", \"\")` 调用，defaultOrgID 与 defaultProjID 都是空串，queryLogs 内 `if defaultOrgID != \"\"`（log.go:63-68）两个分支均不生效，最终 query 只有 `config.DB.Model(&model.OperationLog{})`，没有任何 organization_id/project_id 条件。",
+      "路由 `rg.POST(\"/operation/log/list\", logH.SystemLogList)`（router.go:298）挂在全局 middleware.AuthMiddleware() 之下，但该中间件缺少 token 时既不 Abort 也不返回 response.Unauthorized，因此该查询等价于匿名全表读取。",
+      "响应固定为 `response.SuccessPage(c, list, total, params.Current, params.PageSize)`，list 由 `make([]LogItemDTO, 0, len(logs))` 构造（空结果为 []），status 字段恒为硬编码 \"SUCCESS\"，createdAt 直接回传毫秒时间戳。",
+      "实测（本机 8081）：不带任何凭据 POST /operation/log/list 返回 code=200/total=53，包含 organizationId=100001 与 SYSTEM 等跨租户行；额外附带 ORGANIZATION: 100001 仍是 total=53，说明请求头对系统日志完全无效。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-9-1-system-log-tenant-scope",
+      "title": "系统操作日志接口无租户作用域且无需鉴权即可读取全表审计轨迹",
+      "riskLevel": "P0",
+      "riskTag": "越权/跨租户泄漏",
+      "riskDescription": "任何能访问 8081 的调用方（无需登录、无需 token）执行 POST /operation/log/list 即可分页遍历 operation_log 全表，拿到所有组织/项目的操作人（createUser/userName）、操作内容（content）、模块、路径与时间戳。前端 request.ts 只在 token 存在时才注入 ORGANIZATION/PROJECT 头，因此「未登录/凭据失效」场景会静默退化为全量返回：既没有 401，也没有任何告警，审计轨迹（含 SYSTEM 级登录日志）一次性外泄，且无法从接口日志中区分合法与非法读取。",
+      "impactScope": [
+        "handler.LogHandler.SystemLogList",
+        "handler.LogHandler.queryLogs",
+        "middleware.AuthMiddleware",
+        "internal/handler/log.go:162-165",
+        "internal/handler/log.go:61-99",
+        "internal/router/router.go:297-300",
+        "internal/middleware/auth.go:38-68",
+        "table operation_log"
+      ],
+      "strategy": "在独立库造 org-A/org-B 各 1 条 operation_log，以 gin.New() 注册 POST /operation/log/list，请求带 ORGANIZATION: org-A 且不带 X-AUTH-TOKEN；断言 code 不为 200（或 list 中 organizationId 唯一为 org-A）且 total==1；再对真实路由做无凭据全表比对，total 必须等于 `SELECT COUNT(*) FROM operation_log WHERE organization_id=?`。",
+      "verificationChecklist": [
+        "无凭据请求必须返回 401/100401，不得返回日志数据",
+        "响应 list 中 organizationId 只能等于调用方所属组织",
+        "total 必须等于带组织条件的 COUNT(*)，不得等于全表行数",
+        "SYSTEM 模块日志仅对系统管理员可见",
+        "审计日志读取行为本身必须留痕（访问审计）"
+      ],
+      "cases": [
+        {
+          "id": "tc-9-1-system-log-tenant-scope-01",
+          "name": "TestLogFM_SystemLogList_LeaksCrossOrganizationAuditTrail",
+          "lang": "go",
+          "filePath": "internal/handler/log_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n    \"bytes\"\n    \"encoding/json\"\n    \"fmt\"\n    \"net/http\"\n    \"net/http/httptest\"\n    \"os\"\n    \"testing\"\n    \"time\"\n\n    \"github.com/gin-gonic/gin\"\n    \"gorm.io/driver/mysql\"\n    \"gorm.io/gorm\"\n    \"gorm.io/gorm/logger\"\n\n    \"trueone-anubis/config\"\n    \"trueone-anubis/internal/handler\"\n    \"trueone-anubis/internal/model\"\n)\n\ntype logFMEAEnvelope struct {\n    Code    int             `json:\"code\"`\n    Data    json.RawMessage `json:\"data\"`\n    Message string          `json:\"message\"`\n}\n\n// logFMEAPage 对应 response.PageResult\ntype logFMEAPage struct {\n    List       []map[string]interface{} `json:\"list\"`\n    Total      int64                    `json:\"total\"`\n    Current    int                      `json:\"current\"`\n    PageSize   int                      `json:\"pageSize\"`\n    TotalPages int64                    `json:\"totalPages\"`\n}\n\n// setupLogFMEA 使用独立库 anubis_fmea_test（TEST_MYSQL_DSN 需以 / 结尾）\nfunc setupLogFMEA(t *testing.T) *gorm.DB {\n    t.Helper()\n    dsn := os.Getenv(\"TEST_MYSQL_DSN\")\n    if dsn == \"\" {\n        dsn = \"root:root@tcp(127.0.0.1:3307)/\"\n    }\n    admin, err := gorm.Open(mysql.Open(dsn+\"?charset=utf8mb4&parseTime=true&loc=Local\"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})\n    if err != nil {\n        t.Skipf(\"MySQL 测试实例不可用，跳过: %v\", err)\n    }\n    if err := admin.Exec(\"CREATE DATABASE IF NOT EXISTS anubis_fmea_test DEFAULT CHARSET utf8mb4\").Error; err != nil {\n        t.Skipf(\"无法创建测试库，跳过: %v\", err)\n    }\n    db, err := gorm.Open(mysql.Open(dsn+\"anubis_fmea_test?charset=utf8mb4&parseTime=true&loc=Local\"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})\n    if err != nil {\n        t.Fatalf(\"连接测试库失败: %v\", err)\n    }\n    if err := db.AutoMigrate(&model.OperationLog{}, &model.User{}, &model.Organization{}, &model.Project{}); err != nil {\n        t.Fatalf(\"AutoMigrate 失败: %v\", err)\n    }\n    for _, m := range []interface{}{&model.OperationLog{}, &model.User{}, &model.Organization{}, &model.Project{}} {\n        if err := db.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(m).Error; err != nil {\n            t.Fatalf(\"清理测试数据失败: %v\", err)\n        }\n    }\n    config.DB = db\n    return db\n}\n\nfunc newLogFMEAPage(t *testing.T, body []byte) logFMEAPage {\n    t.Helper()\n    var env logFMEAEnvelope\n    if err := json.Unmarshal(body, &env); err != nil {\n        t.Fatalf(\"响应不是 {code,data,message} 契约结构: %v body=%s\", err, body)\n    }\n    if env.Code != 200 {\n        t.Fatalf(\"期望 code=200，实际 %d message=%s\", env.Code, env.Message)\n    }\n    var page logFMEAPage\n    if err := json.Unmarshal(env.Data, &page); err != nil {\n        t.Fatalf(\"data 不是分页结构: %v data=%s\", err, env.Data)\n    }\n    return page\n}\n\nfunc TestLogFM_SystemLogList_LeaksCrossOrganizationAuditTrail(t *testing.T) {\n    db := setupLogFMEA(t)\n    now := time.Now().UnixMilli()\n    if err := db.Create(&[]model.OperationLog{\n        {ID: 101, ProjectID: \"proj-A\", OrganizationID: \"org-A\", CreatedAt: now, CreateUser: \"admin\", SourceID: \"s1\", Type: \"ADD\", Module: \"SYSTEM\", Content: \"org-A 审计\"},\n        {ID: 102, ProjectID: \"proj-B\", OrganizationID: \"org-B\", CreatedAt: now, CreateUser: \"admin\", SourceID: \"s2\", Type: \"ADD\", Module: \"SYSTEM\", Content: \"org-B 机密审计\"},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.POST(\"/operation/log/list\", handler.NewLogHandler().SystemLogList)\n\n    req := httptest.NewRequest(http.MethodPost, \"/operation/log/list\", bytes.NewBufferString(`{\"current\":1,\"pageSize\":10}`))\n    req.Header.Set(\"Content-Type\", \"application/json\")\n    req.Header.Set(\"ORGANIZATION\", \"org-A\")\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, req)\n\n    if w.Code != http.StatusOK {\n        t.Fatalf(\"期望 HTTP 200，实际 %d\", w.Code)\n    }\n    page := newLogFMEAPage(t, w.Body.Bytes())\n    for _, item := range page.List {\n        if fmt.Sprint(item[\"organizationId\"]) != \"org-A\" {\n            t.Errorf(\"跨租户泄漏：ORGANIZATION=org-A 的无凭据请求读到了 organizationId=%v 的审计日志（期望仅 org-A）\", item[\"organizationId\"])\n        }\n    }\n    if page.Total != 1 {\n        t.Errorf(\"期望 total=1（仅 org-A），实际 total=%d（当前实现无租户条件，命中全表）\", page.Total)\n    }\n}",
+          "evidence": {
+            "assertion": "断言无 X-AUTH-TOKEN、ORGANIZATION: org-A 的请求返回 total==1 且 list 中 organizationId 全部为 org-A",
+            "dbStateDiff": "[READ-ONLY] 仅 SELECT ... FROM operation_log（当前实现无 WHERE organization_id，全表扫描）",
+            "traceLog": "HTTP 200 + code=200；实测本地 total=53 且包含 organizationId=100001/SYSTEM 等跨租户行"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "仓库内没有任何 *_test.go，也没有 seed/migration 文件可以定义「组织-用户」成员关系；审计日志的读取本身未被审计，黑盒无法区分合法与越权读取。",
+        "onlineMonitoring": "为 /operation/log/list 埋点调用方组织与返回 total：total 大于该组织 operation_log 行数、或响应包含非本组织 organizationId 时立即告警；同时对缺失 X-AUTH-TOKEN 的请求计数（应恒为 0）。"
+      }
+    }
+  },
+  {
+    "id": "sec-9-2-org-project-log-scope",
+    "sectionNumber": "9.2",
+    "lineStart": 214,
+    "lineEnd": 246,
+    "title": "组织日志与项目日志的租户作用域（/organization/log/list、/project/log/list）",
+    "paragraphs": [
+      "OrgLogList 取 `orgID := c.GetHeader(\"ORGANIZATION\")` 后调用 `h.queryLogs(c, orgID, \"\")`（log.go:215-218）；ProjectLogList 取 `projID := c.GetHeader(\"PROJECT\")` 后调用 `h.queryLogs(c, \"\", projID)`（log.go:243-246）——请求头即唯一租户边界，既不校验 token，也不校验调用者与该组织/项目的成员关系。",
+      "对比 dashboard.go:20-23 的写法（先取请求头，再回退 `c.Query(\"projectId\")`），ProjectLogList 没有 query/body 回退，PROJECT 头缺失时 defaultProjID 为空串，条件被跳过，直接退化为全项目查询。",
+      "OrgLogOptions 用路径参数 `:organizationId` 查项目下拉（`Where(\"organization_id = ? AND deleted = 0\", orgID)`），允许枚举任意组织的项目清单；OrgLogUsers/ProjectLogUsers 直接复用 SystemLogUsers，路径上的 :organizationId/:projectId 完全未使用。",
+      "实测（本机 8081）：POST /organization/log/list 带 ORGANIZATION: SYSTEM（无任何凭据）返回 code=200/total=44，行内 organizationId 全为 SYSTEM；POST /project/log/list 不带 PROJECT 头返回 total=53（全表）。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-9-2-org-project-log-scope",
+      "title": "组织/项目日志以调用方自选的请求头作为租户边界，可跨组织读取审计轨迹",
+      "riskLevel": "P0",
+      "riskTag": "越权/跨租户泄漏",
+      "riskDescription": "调用方只需把 ORGANIZATION 头写成目标组织 ID（或 PROJECT 头写成目标项目 ID）即可完整读取该组织/项目的审计轨迹，无需登录、无需属于该组织：实测 ORGANIZATION: SYSTEM 返回 44 条 SYSTEM 级日志，PROJECT 头缺失时 /project/log/list 返回全表 53 条。这不是「参数校验不严」而是租户边界的根本缺失——queryLogs 把外部可控的 header 值直接拼进 `Where(\"organization_id = ?\")`，且 AuthMiddleware 从不 Abort、也没有任何成员关系表校验。附带风险：/organization/log/get/options/:organizationId 允许枚举任意组织的项目列表，形成跨租户信息收集面。",
+      "impactScope": [
+        "handler.LogHandler.OrgLogList",
+        "handler.LogHandler.ProjectLogList",
+        "handler.LogHandler.OrgLogOptions",
+        "handler.LogHandler.OrgLogUsers",
+        "internal/handler/log.go:214-246",
+        "internal/handler/log.go:63-68",
+        "internal/router/router.go:302-307",
+        "table operation_log, project, organization"
+      ],
+      "strategy": "造 org-A 1 条 + org-B 2 条 operation_log，以 gin.New() 注册 POST /organization/log/list，请求仅带 ORGANIZATION: org-B（无 X-AUTH-TOKEN）；断言 code 不为 200 或返回 total==0（不能返回 org-B 的 2 条）；再注册 POST /project/log/list 且不带 PROJECT 头，断言 total 不等于全表行数。",
+      "verificationChecklist": [
+        "请求头不得作为唯一租户边界，必须结合会话用户所属组织校验",
+        "无凭据的 ORGANIZATION: org-B 请求必须被拒绝",
+        "PROJECT 头缺失时不得退化为全项目查询",
+        "/organization/log/get/options/:organizationId 必须校验调用方属于该组织",
+        "组织/项目日志同样需要读取留痕"
+      ],
+      "cases": [
+        {
+          "id": "tc-9-2-org-project-log-scope-01",
+          "name": "TestLogFM_OrgLogList_TrustsClientSuppliedOrganizationHeader",
+          "lang": "go",
+          "filePath": "internal/handler/log_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupLogFMEA / logFMEAEnvelope / logFMEAPage / newLogFMEAPage helper =====\n\nfunc TestLogFM_OrgLogList_TrustsClientSuppliedOrganizationHeader(t *testing.T) {\n    db := setupLogFMEA(t)\n    now := time.Now().UnixMilli()\n    if err := db.Create(&[]model.OperationLog{\n        {ID: 201, ProjectID: \"proj-A\", OrganizationID: \"org-A\", CreatedAt: now, CreateUser: \"admin\", Type: \"ADD\", Module: \"ORG\", Content: \"A 组织日志\"},\n        {ID: 202, ProjectID: \"proj-B\", OrganizationID: \"org-B\", CreatedAt: now, CreateUser: \"admin\", Type: \"ADD\", Module: \"ORG\", Content: \"B 组织日志1\"},\n        {ID: 203, ProjectID: \"proj-B\", OrganizationID: \"org-B\", CreatedAt: now, CreateUser: \"admin\", Type: \"ADD\", Module: \"ORG\", Content: \"B 组织日志2\"},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.POST(\"/organization/log/list\", handler.NewLogHandler().OrgLogList)\n\n    req := httptest.NewRequest(http.MethodPost, \"/organization/log/list\", bytes.NewBufferString(`{\"current\":1,\"pageSize\":50}`))\n    req.Header.Set(\"Content-Type\", \"application/json\")\n    req.Header.Set(\"ORGANIZATION\", \"org-B\")\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, req)\n\n    var env logFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"响应不是 {code,data,message} 契约结构: %v body=%s\", err, w.Body.String())\n    }\n    if env.Code == 200 {\n        var page logFMEAPage\n        if err := json.Unmarshal(env.Data, &page); err == nil && page.Total > 0 {\n            t.Errorf(\"越权复现：无任何凭据的调用方仅凭 ORGANIZATION=org-B 即读到该组织 %d 条审计日志（期望拒绝或按会话组织收敛）\", page.Total)\n        }\n    }\n}\n\n// ===== 复用同文件顶部 helper =====\n\nfunc TestLogFM_ProjectLogList_WithoutProjectHeaderFallsBackToWholeTable(t *testing.T) {\n    db := setupLogFMEA(t)\n    now := time.Now().UnixMilli()\n    if err := db.Create(&[]model.OperationLog{\n        {ID: 301, ProjectID: \"proj-A\", OrganizationID: \"org-A\", CreatedAt: now, CreateUser: \"admin\", Type: \"ADD\", Module: \"CASE\", Content: \"A 项目日志\"},\n        {ID: 302, ProjectID: \"proj-B\", OrganizationID: \"org-A\", CreatedAt: now, CreateUser: \"admin\", Type: \"ADD\", Module: \"CASE\", Content: \"B 项目日志\"},\n        {ID: 303, ProjectID: \"SYSTEM\", OrganizationID: \"SYSTEM\", CreatedAt: now, CreateUser: \"admin\", Type: \"LOGIN\", Module: \"SYSTEM\", Content: \"登录\"},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.POST(\"/project/log/list\", handler.NewLogHandler().ProjectLogList)\n\n    req := httptest.NewRequest(http.MethodPost, \"/project/log/list\", bytes.NewBufferString(`{\"current\":1,\"pageSize\":50}`))\n    req.Header.Set(\"Content-Type\", \"application/json\")\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, req)\n\n    page := newLogFMEAPage(t, w.Body.Bytes())\n    if page.Total != 0 {\n        t.Errorf(\"PROJECT 头缺失时不应返回任何项目的日志（期望拒绝请求），实际 total=%d，覆盖 proj-A/proj-B/SYSTEM 全部数据\", page.Total)\n    }\n}",
+          "evidence": {
+            "assertion": "断言无凭据 + ORGANIZATION=org-B 的响应不得返回任何 org-B 日志（page.Total 必须为 0）；并断言 /project/log/list 缺 PROJECT 头时 total==0",
+            "dbStateDiff": "[READ-ONLY] 两个用例仅 SELECT，无写操作；注意 SELECT 条件使用的是外部可控的 header 值",
+            "traceLog": "HTTP 200 + code=200；实测 ORGANIZATION=SYSTEM 返回 44 条、无 PROJECT 头返回 53 条"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "缺少组织/项目成员关系表（organization_member/project_member）的种子与语义定义，无法断言「调用者属于该组织」的判定逻辑；AuthMiddleware 不 Abort，无法在路由层断言 401。",
+        "onlineMonitoring": "对 organization/log/list 与 project/log/list 埋点（header 组织 vs 会话用户所属组织），两者不一致时告警；PROJECT 头缺失的请求数应恒为 0。"
+      }
+    }
+  },
+  {
+    "id": "sec-9-3-log-query-params",
+    "sectionNumber": "9.3",
+    "lineStart": 48,
+    "lineEnd": 99,
+    "title": "日志查询参数、时间范围与分页（queryLogs 与 LogQueryParams）",
+    "paragraphs": [
+      "LogQueryParams 声明了 `Content string json:\"content\"`，但 queryLogs 只消费 Keyword/OperUser/StartTime/EndTime/ProjectIDs/OrganizationIDs/Type/Module（log.go:69-92），params.Content 从未进入任何 Where —— 而前端 logService.formatQueryParams 会下发 content（实测 content=NEEDLE_XYZ 仍返回全表 53 条，同值的 keyword 返回 0 条）。",
+      "ShouldBindJSON 失败时只做 `params.Current = 1; params.PageSize = 10`（log.go:50-53），客户端分页意图被丢弃（实测 {\"current\":3,\"pageSize\":5,\"startTime\":\"not-a-number\"} 返回 current=1/pageSize=10）。",
+      "params.StartTime/EndTime 是未做单位校验的 int64，直接与毫秒列比较（audit.go:81 写入 `time.Now().UnixMilli()`，auth.go:80/232 同理）：毫秒入参工作正常，但秒级入参会让过滤静默失效或全空（实测 startTime=1790655430 → total=53 全表；endTime=1790655432 → total=0），无异常、无日志。",
+      "`query.Count(&total)` 的 error 被忽略；名称映射用的 `config.DB.Find(&users)`/`Find(&orgs)`/`Find(&projs)`（log.go:102-121）没有 deleted = 0 条件，会把已软删的用户/组织/项目名也映射进来，并且每页请求都要全表加载三张表。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-9-3-log-query-params",
+      "title": "content 过滤被静默丢弃、绑定失败即重置分页、时间戳单位未归一化导致过滤静默失效",
+      "riskLevel": "P1",
+      "riskTag": "静默过滤失效/时序单位/分页一致性",
+      "riskDescription": "三个可观测症状：① 前端日志检索框的 content 条件被完全忽略，用户以为在看筛选结果，实际是全量数据（过滤失效的直接后果是信息暴露面放大）；② 只要一个字段类型不符（例如 startTime 传成字符串或前后端时间戳单位不一致），整个请求的分页被强制成第 1 页 10 条，用户翻到第 3 页再改筛选条件会被静默弹回首页，且 code=200 无任何提示；③ StartTime/EndTime 未做秒/毫秒归一化，秒级时间戳会被当成毫秒比较——startTime 变小时过滤条件恒真（返回全表），endTime 变小时恒假（返回空），两类都是静默错误，最容易在联调中被误判为「后端没数据」。",
+      "impactScope": [
+        "handler.LogQueryParams",
+        "handler.LogHandler.queryLogs",
+        "internal/handler/log.go:48-99",
+        "internal/handler/log.go:102-121",
+        "internal/service/audit.go:81",
+        "table operation_log, user, organization, project",
+        "前端 src/services/log/logService.ts formatQueryParams"
+      ],
+      "strategy": "造 2 条 content 不同的日志：① 请求 body 带 content=MATCH-TARGET，断言 total==1（当前为 2，证明过滤被丢弃）；② 请求 body 带合法 current=3/pageSize=5 加一个非法 startTime，断言回显 current==3/pageSize==5（当前被重置为 1/10）；③ 分别用毫秒与秒级 startTime 请求，断言两者返回一致的结果集（当前秒级返回全表）。",
+      "verificationChecklist": [
+        "content 参数必须生效（与 keyword 至少等价）",
+        "ShouldBindJSON 失败必须返回 code=400，而不是静默重置分页",
+        "秒级与毫秒级时间戳必须归一化或显式拒绝",
+        "响应 total 必须与相同 WHERE 的 SELECT COUNT(*) 相等",
+        "名称映射不得包含 deleted=1 的用户/组织/项目"
+      ],
+      "cases": [
+        {
+          "id": "tc-9-3-log-query-params-01",
+          "name": "TestLogFM_ListQueryParams_ContentFilterDroppedAndBindErrorResetsPaging",
+          "lang": "go",
+          "filePath": "internal/handler/log_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 helper =====\n\nfunc TestLogFM_ListQueryParams_ContentFilterDroppedAndBindErrorResetsPaging(t *testing.T) {\n    db := setupLogFMEA(t)\n    now := time.Now().UnixMilli()\n    if err := db.Create(&[]model.OperationLog{\n        {ID: 401, ProjectID: \"p1\", OrganizationID: \"org-A\", CreatedAt: now, CreateUser: \"admin\", Type: \"ADD\", Module: \"SYSTEM\", Content: \"MATCH-TARGET\"},\n        {ID: 402, ProjectID: \"p1\", OrganizationID: \"org-A\", CreatedAt: now, CreateUser: \"admin\", Type: \"ADD\", Module: \"SYSTEM\", Content: \"OTHER\"},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.POST(\"/operation/log/list\", handler.NewLogHandler().SystemLogList)\n\n    call := func(body string) logFMEAPage {\n        req := httptest.NewRequest(http.MethodPost, \"/operation/log/list\", bytes.NewBufferString(body))\n        req.Header.Set(\"Content-Type\", \"application/json\")\n        w := httptest.NewRecorder()\n        r.ServeHTTP(w, req)\n        return newLogFMEAPage(t, w.Body.Bytes())\n    }\n\n    byContent := call(`{\"current\":1,\"pageSize\":10,\"content\":\"MATCH-TARGET\"}`)\n    if byContent.Total != 1 {\n        t.Errorf(\"content 过滤应命中 1 条，实际 total=%d（前端 formatQueryParams 下发的 content 从未进入 Where）\", byContent.Total)\n    }\n\n    reset := call(`{\"current\":3,\"pageSize\":5,\"startTime\":\"not-a-number\"}`)\n    if reset.Current != 3 || reset.PageSize != 5 {\n        t.Errorf(\"绑定失败后分页被强制重置，期望回显 current=3/pageSize=5，实际 current=%d pageSize=%d\", reset.Current, reset.PageSize)\n    }\n\n    msFiltered := call(fmt.Sprintf(`{\"current\":1,\"pageSize\":10,\"startTime\":%d}`, now-1000))\n    secondsFiltered := call(fmt.Sprintf(`{\"current\":1,\"pageSize\":10,\"startTime\":%d}`, (now-1000)/1000))\n    if msFiltered.Total != secondsFiltered.Total {\n        t.Errorf(\"时间戳单位未归一化：毫秒入参 total=%d 而秒级入参 total=%d（秒级被当成毫秒，过滤静默失效）\", msFiltered.Total, secondsFiltered.Total)\n    }\n}",
+          "evidence": {
+            "assertion": "断言 content=MATCH-TARGET 时 total==1、非法 startTime 时仍回显 current=3/pageSize=5、毫秒与秒级 startTime 的 total 相等",
+            "dbStateDiff": "[READ-ONLY] 仅 SELECT，无写操作；观察点在于 WHERE 子句是否包含 content 与正确的时间边界",
+            "traceLog": "HTTP 200 + code=200；实测 content 返回 total=2（全表）、非法 startTime 返回 current=1/pageSize=10、秒级 startTime 返回全表"
+          }
+        },
+        {
+          "id": "tc-9-3-log-query-params-02",
+          "name": "TestLogFM_QueryParams_EndTimeSecondsAndCountConsistency",
+          "lang": "go",
+          "filePath": "internal/handler/log_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 helper =====\n\nfunc TestLogFM_QueryParams_EndTimeSecondsAndCountConsistency(t *testing.T) {\n    db := setupLogFMEA(t)\n    base := time.Now().UnixMilli()\n    if err := db.Create(&[]model.OperationLog{\n        {ID: 501, ProjectID: \"p1\", OrganizationID: \"org-A\", CreatedAt: base - 10000, CreateUser: \"admin\", Type: \"ADD\", Module: \"SYSTEM\", Content: \"较早\"},\n        {ID: 502, ProjectID: \"p1\", OrganizationID: \"org-A\", CreatedAt: base - 5000, CreateUser: \"admin\", Type: \"ADD\", Module: \"SYSTEM\", Content: \"中间\"},\n        {ID: 503, ProjectID: \"p1\", OrganizationID: \"org-A\", CreatedAt: base - 1000, CreateUser: \"admin\", Type: \"ADD\", Module: \"SYSTEM\", Content: \"最新\"},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.POST(\"/operation/log/list\", handler.NewLogHandler().SystemLogList)\n\n    call := func(body string) logFMEAPage {\n        req := httptest.NewRequest(http.MethodPost, \"/operation/log/list\", bytes.NewBufferString(body))\n        req.Header.Set(\"Content-Type\", \"application/json\")\n        w := httptest.NewRecorder()\n        r.ServeHTTP(w, req)\n        return newLogFMEAPage(t, w.Body.Bytes())\n    }\n\n    msWindow := call(fmt.Sprintf(`{\"current\":1,\"pageSize\":10,\"startTime\":%d,\"endTime\":%d}`, base-6000, base))\n    if msWindow.Total != 2 {\n        t.Fatalf(\"前置条件失败：毫秒时间窗应命中 2 条，实际 %d\", msWindow.Total)\n    }\n\n    var dbCount int64\n    if err := db.Model(&model.OperationLog{}).Where(\"created_at >= ? AND created_at <= ?\", base-6000, base).Count(&dbCount).Error; err != nil {\n        t.Fatalf(\"DB 计数失败: %v\", err)\n    }\n    if msWindow.Total != dbCount {\n        t.Errorf(\"响应 total=%d 与 SELECT COUNT(*)=%d 不一致（Count error 被忽略）\", msWindow.Total, dbCount)\n    }\n\n    secondsWindow := call(fmt.Sprintf(`{\"current\":1,\"pageSize\":10,\"startTime\":%d,\"endTime\":%d}`, (base-6000)/1000, base/1000))\n    if secondsWindow.Total != msWindow.Total {\n        t.Errorf(\"endTime 使用秒级时间戳时 total=%d（毫秒为 %d）：秒被当作毫秒比较导致结果集静默为空\", secondsWindow.Total, msWindow.Total)\n    }\n}",
+          "evidence": {
+            "assertion": "断言毫秒时间窗的 total 等于同条件 SELECT COUNT(*)（==2），且秒级时间窗的 total 与毫秒一致",
+            "dbStateDiff": "[READ-ONLY] 仅 SELECT COUNT(*)/SELECT *，无写操作",
+            "traceLog": "HTTP 200 + code=200；实测秒级 endTime 返回 total=0（恒假条件），无任何错误提示"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "LogQueryParams 未使用 binding tag，ShouldBind 的具体失败分支依赖客户端字段类型，需要契约测试（schemathesis/pact）覆盖；老系统 Java Long 毫秒约定没有在本仓库留下契约快照。",
+        "onlineMonitoring": "对日志查询接口记录「返回 total 与请求过滤条件」的采样：total 等于全表行数但携带了过滤条件时告警；对 ShouldBindJSON 失败次数埋点（当前失败即静默重置分页，应改为 400）。"
+      }
+    }
+  },
+  {
+    "id": "sec-9-4-log-options-users",
+    "sectionNumber": "9.4",
+    "lineStart": 167,
+    "lineEnd": 212,
+    "title": "日志筛选项与操作人候选（/operation/log/get/options、/operation/log/user/list）",
+    "paragraphs": [
+      "SystemLogOptions 用 `config.DB.Where(\"deleted = 0\").Find(&orgs)` 与同样的方式查 project（log.go:167-192），返回全部组织与全部项目（id/name），没有任何组织作用域，也没有分页。",
+      "SystemLogUsers 用 `config.DB.Where(\"deleted = 0\")` 查 user 表，keyword 只对 name/email 做 LIKE（log.go:194-212），返回 id/name/email；OrgLogUsers/ProjectLogUsers 直接把它复用（`h.SystemLogUsers(c)`），路径参数 :organizationId/:projectId 被忽略，等于全租户用户目录。",
+      "两个接口都在 router.go:299-307 注册且无需鉴权（AuthMiddleware 不 Abort）。实测 GET /operation/log/get/options 未鉴权即返回 2 个组织与 2 个项目，GET /operation/log/user/list 未鉴权即返回 email=admin@metersphere.io。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-9-4-log-options-users",
+      "title": "筛选项与用户候选接口无鉴权、无租户作用域，泄露全量组织/项目清单与用户邮箱",
+      "riskLevel": "P1",
+      "riskTag": "越权/敏感信息泄漏",
+      "riskDescription": "两个接口是日志页面加载时的下拉数据源，无需任何凭据即可调用：/operation/log/get/options 返回全部组织与项目（跨租户资产清单，可用于枚举他人 tenantId 再配合 9.2 的请求头越权读取日志），/operation/log/user/list 返回用户 id/name/email（PII，可直接用于钓鱼与撞库）。OrgLogUsers/ProjectLogUsers 复用同一实现，路径上声明的 organizationId/projectId 完全被忽略，意味着「按组织筛选操作人」的功能在契约上是假的；由于没有 LIMIT，用户表规模增大后该接口还会成为慢查询。",
+      "impactScope": [
+        "handler.LogHandler.SystemLogOptions",
+        "handler.LogHandler.SystemLogUsers",
+        "handler.LogHandler.OrgLogUsers",
+        "handler.LogHandler.ProjectLogUsers",
+        "internal/handler/log.go:167-212",
+        "internal/router/router.go:299-307",
+        "table organization, project, user"
+      ],
+      "strategy": "造 2 个组织 + 2 个项目 + 1 个用户，未鉴权调用 GET /operation/log/get/options，断言 organizationList 中不含非本组织的 org-B；未鉴权调用 GET /operation/log/user/list，断言响应不包含 email 字段或返回 401；再调用 /operation/log/user/list/{organizationId} 断言 user 集合按该组织收敛。",
+      "verificationChecklist": [
+        "options 接口必须按调用方组织收敛且需要鉴权",
+        "user/list 不得未鉴权返回 email（PII）",
+        "OrgLogUsers/ProjectLogUsers 必须消费 :organizationId/:projectId 并校验成员关系",
+        "返回列表必须有分页或 LIMIT，避免全表加载",
+        "软删（deleted=1）的用户/组织/项目不得出现在候选列表"
+      ],
+      "cases": [
+        {
+          "id": "tc-9-4-log-options-users-01",
+          "name": "TestLogFM_SystemLogOptions_ExposesAllTenantsAndUserEmails",
+          "lang": "go",
+          "filePath": "internal/handler/log_fmea_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "// ===== 复用同文件顶部 setupLogFMEA / logFMEAEnvelope helper =====\n\nfunc TestLogFM_SystemLogOptions_ExposesAllTenantsAndUserEmails(t *testing.T) {\n    db := setupLogFMEA(t)\n    if err := db.Create(&[]model.Organization{\n        {ID: \"org-A\", Name: \"A 组织\", Deleted: model.BitBool(false)},\n        {ID: \"org-B\", Name: \"B 组织\", Deleted: model.BitBool(false)},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n    if err := db.Create(&[]model.Project{\n        {ID: \"proj-A\", OrganizationID: \"org-A\", Name: \"A 项目\", Deleted: model.BitBool(false)},\n        {ID: \"proj-B\", OrganizationID: \"org-B\", Name: \"B 项目\", Deleted: model.BitBool(false)},\n    }).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n    if err := db.Create(&model.User{ID: \"u-1\", Name: \"张三\", Email: \"zhangsan@corp.com\", Deleted: model.BitBool(false)}).Error; err != nil {\n        t.Fatalf(\"造数失败: %v\", err)\n    }\n\n    gin.SetMode(gin.TestMode)\n    r := gin.New()\n    r.GET(\"/operation/log/get/options\", handler.NewLogHandler().SystemLogOptions)\n    r.GET(\"/operation/log/user/list\", handler.NewLogHandler().SystemLogUsers)\n\n    w := httptest.NewRecorder()\n    r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, \"/operation/log/get/options\", nil))\n    var env logFMEAEnvelope\n    if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {\n        t.Fatalf(\"解析 options 响应失败: %v body=%s\", err, w.Body.String())\n    }\n    if bytes.Contains(env.Data, []byte(`\"org-B\"`)) {\n        t.Errorf(\"未鉴权请求即可枚举其他组织的筛选项（含 org-B），data=%s\", env.Data)\n    }\n\n    w2 := httptest.NewRecorder()\n    r.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, \"/operation/log/user/list\", nil))\n    var env2 logFMEAEnvelope\n    if err := json.Unmarshal(w2.Body.Bytes(), &env2); err != nil {\n        t.Fatalf(\"解析 user/list 响应失败: %v body=%s\", err, w2.Body.String())\n    }\n    if bytes.Contains(env2.Data, []byte(\"zhangsan@corp.com\")) {\n        t.Errorf(\"未鉴权请求即可读取用户邮箱（PII 泄露），data=%s\", env2.Data)\n    }\n}",
+          "evidence": {
+            "assertion": "断言未鉴权的 options 响应不含 \"org-B\"，未鉴权的 user/list 响应不含 zhangsan@corp.com",
+            "dbStateDiff": "[READ-ONLY] 仅 SELECT organization/project/user，无写操作",
+            "traceLog": "HTTP 200 + code=200；实测 options 返回 2 组织 2 项目、user/list 返回 admin@metersphere.io"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无鉴权中间件拦截点，单测只能在路由层断言响应内容；user 表真实规模与 PII 分级策略不在本仓库定义。",
+        "onlineMonitoring": "对 /operation/log/user/list 的匿名调用计数告警；响应体包含 email 时记敏感数据外发审计；options 返回组织数超过调用方所属组织数时告警。"
+      }
+    }
+  }
+]

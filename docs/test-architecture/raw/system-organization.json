@@ -1,0 +1,796 @@
+[
+  {
+    "id": "sec-system-user-page",
+    "sectionNumber": "7.1",
+    "lineStart": 21,
+    "lineEnd": 151,
+    "title": "系统用户列表、用户分页查询与全局角色选项",
+    "paragraphs": [
+      "GET /system/user → SystemHandler.UserList：config.DB.Where(\"deleted = 0\").Find(&users) 后直接 response.Success(c, users)，把 model.User 全字段原样下发（只有 Password 因 json:\"-\" 被隐藏），cftToken、larkOpenId、larkUnionId、source 全部暴露，且无分页、无条数上限。",
+      "POST /system/user/list 与 POST /system/user/page 共用 SystemHandler.UserPage：c.ShouldBindJSON(&params) 的错误被 `_ =` 丢弃，Current/PageSize 只做 <=0 兜底，PageSize 无上限；Keyword 直接拼进 name LIKE ? OR email LIKE ?，未转义 % 与 _。",
+      "UserPage 为拼 organizationList/userRoleList/userRoles，把 organization、user_role、user_role_relation 三张表整表载入内存（config.DB.Find(&roles) 与 config.DB.Find(&relations) 都没有 scope 或 deleted 过滤），只按 LastOrganizationID 取一个组织，且 UserRoleList 与 UserRoles 是同一份 ur。",
+      "SystemRoles（GET /system/user/get/global/system/role）返回 RoleOption{Selected:false, Closeable:true} 常量，完全忽略当前用户已有角色；其过滤条件 scope_id = 'global' OR type = 'SYSTEM' 会把 bootstrap 中 6 个角色的 ScopeID=\"global\"（含 org_admin、project_admin）一并返回。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-system-user-page",
+      "title": "匿名读取全量用户并泄露 cftToken，userRoles 跨组织串角色",
+      "riskLevel": "P0",
+      "riskTag": "鉴权绕过/敏感字段泄露",
+      "riskDescription": "无 X-AUTH-TOKEN 时 middleware.AuthMiddleware 直接 c.Next() 放行且不设置 userId，UserList/UserPage 因此对匿名请求返回全量用户；model.User.CftToken 是可用于外部插件鉴权的个人令牌，被原样下发等于凭据泄露（larkOpenId/larkUnionId/source 同样属于身份标识）。同时 userRoles 不区分 scope，会把其他组织/项目下的角色关系挂到该用户上，前端“成员角色”列显示跨组织角色。可观察症状：curl -s localhost:8081/system/user 在未登录状态返回 {\"code\":200,\"message\":\"success\",\"data\":[{\"id\":\"admin\",...,\"cftToken\":\"SECRET-CFT-TOKEN\"}]}；用户编辑页的角色下拉把 org_admin、project_admin 当作系统角色展示，保存后会给普通用户授出组织/项目管理员。",
+      "impactScope": [
+        "SystemHandler.UserList",
+        "SystemHandler.UserPage",
+        "SystemHandler.SystemRoles",
+        "internal/handler/system.go:21-151",
+        "internal/middleware/auth.go:38-68",
+        "table: user",
+        "table: user_role",
+        "table: user_role_relation"
+      ],
+      "strategy": "1) 起一次性 MySQL schema 并 AutoMigrate，插入一条 cftToken 非空的 user；2) 不带任何鉴权头 GET /system/user，断言 401 且响应体不含该令牌值，当前实现会返回 200 + 明文令牌；3) POST /system/user/page 传 pageSize=100000 与 keyword=\"%\"，断言返回条数被钳制、keyword 不退化为全表匹配；4) 造两个组织各一条 role + relation，断言目标用户的 userRoles 只包含本组织角色。",
+      "verificationChecklist": [
+        "匿名 GET /system/user 返回 401（或空 data），且任何响应体都不含 cftToken/larkOpenId/larkUnionId 的值",
+        "POST /system/user/page 的 pageSize 被钳制（如 <= 100），data.current/pageSize/total/totalPages 与实际返回条数自洽",
+        "keyword 含 % 或 _ 时不退化为全表匹配（需转义）",
+        "某用户的 userRoles 不包含其他 organization 的 role",
+        "GET /system/user/get/global/system/role 只返回 Type=SYSTEM 的系统角色，不包含 org_admin/project_admin"
+      ],
+      "cases": [
+        {
+          "id": "tc-system-user-page-01",
+          "name": "test_SystemUserList_NoToken_MustNotLeakCftToken",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBUserPage(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestSystemUserList_NoToken_MustNotLeakCftToken(t *testing.T) {\n\tdb := setupDBUserPage(t)\n\tif err := db.Exec(\"DELETE FROM `user`\").Error; err != nil {\n\t\tt.Fatalf(\"clean user: %v\", err)\n\t}\n\tif err := db.Create(&model.User{ID: \"admin\", Name: \"Administrator\", Email: \"admin@trueone.io\", Enable: model.BitBool(true), Deleted: model.BitBool(false), CftToken: \"SECRET-CFT-TOKEN\", CreatedAt: 1700000000000}).Error; err != nil {\n\t\tt.Fatalf(\"seed admin: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodGet, \"/system/user\", nil)\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar got struct {\n\t\tCode int `json:\"code\"`\n\t\tData []struct {\n\t\t\tID       string `json:\"id\"`\n\t\t\tCftToken string `json:\"cftToken\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {\n\t\tt.Fatalf(\"unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif w.Code != http.StatusUnauthorized || got.Code != 100401 {\n\t\tt.Fatalf(\"anonymous GET /system/user must be 401/100401, got http=%d code=%d body=%s\", w.Code, got.Code, w.Body.String())\n\t}\n\tif len(got.Data) != 0 {\n\t\tt.Fatalf(\"anonymous response leaked %d user row(s), first id=%q cftToken=%q\", len(got.Data), got.Data[0].ID, got.Data[0].CftToken)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "w.Code == http.StatusUnauthorized 且响应 JSON 中 code == 100401 且 data 为空；当前实现为 http=200、code=200、data[0].id=\"admin\"、data[0].cftToken=\"SECRET-CFT-TOKEN\"",
+            "dbStateDiff": "[READ-ONLY] no write expected（只插入夹具：INSERT INTO user(id,name,email,enable,deleted,cft_token,created_at) VALUES ('admin',...,1,0,'SECRET-CFT-TOKEN',1700000000000)）",
+            "traceLog": "HTTP 200（期望 401）；gin.Default() 访问日志记录 GET /system/user；当前实现无任何鉴权失败告警"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "仓库内不存在任何 *_test.go，handler 层契约与鉴权均无自动化覆盖；middleware 放行匿名请求属全局行为，需要先落一条最小回归用例",
+        "onlineMonitoring": "对 /system/user 系列接口按 HTTP 状态码分布告警：出现 200 且无会话/无 X-AUTH-TOKEN 的请求计数 > 0 即告警；同时对响应体中 cftToken 字段做网关级脱敏与出站审计"
+      }
+    }
+  },
+  {
+    "id": "sec-user-profile-member",
+    "sectionNumber": "7.2",
+    "lineStart": 571,
+    "lineEnd": 636,
+    "title": "用户资料、项目成员与项目角色查询",
+    "paragraphs": [
+      "UserProfile（GET /user/profile）：userId, exists := c.Get(\"userId\")，!exists || userId == \"\" 时回落成字符串 \"admin\"，随后 Where(\"id = ? AND deleted = 0\", userId).First(&u)；First 未命中只产生 ErrRecordNotFound（被丢弃），u 保持零值仍以 response.Success 返回 code 200。",
+      "UserProfilePage（POST /user/profile/page）恒返回 []interface{}{} + total=0 + 写死的 current=1、pageSize=10，完全忽略请求体；UserRoleProjectList（POST /user/role/project/list）执行 config.DB.Find(&roles) 无任何过滤返回 user_role 全表，并写死 SuccessPage(..., len(roles), 1, 100)。",
+      "ProjectMemberList（POST /system/project/member-list 与 POST /project/member/list）用 ShouldBindJSON 读到了 projectId 却从未使用，直接返回 user 表中所有 deleted = 0 的用户，每人 RoleName 硬编码 \"管理员\"，total 用 len(members)、分页写死 1 与 100；ProjectMemberOptions（路由带 :projectId）同样忽略项目维度返回全库用户。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-user-profile-member",
+      "title": "匿名 /user/profile 拿到 admin 资料，项目成员接口泄露全库用户",
+      "riskLevel": "P0",
+      "riskTag": "鉴权绕过/越权",
+      "riskDescription": "1) 匿名请求 /user/profile 会拿到 admin 的完整资料行（id/name/email/phone/lastOrganizationId/lastProjectId）；伪造 token 未命中内存 session 时 middleware 把 token 原文当成 userId（c.Set(\"userId\", token)），First 查不到但接口仍 200 返回零值 user 对象，前端把它当成“已登录用户”并缓存空用户，本应出现的 401 被吞掉。2) 项目成员接口不校验 projectId，A 项目的成员列表把全库用户（含其他组织/其他项目的账号）全部列出且一律标成“管理员”，属于跨项目/跨组织数据泄露；同时 current/pageSize 写死导致前端翻页永远停在第一页。可观察症状：POST /project/member/list {\"projectId\":\"p1\"} 的 total 等于 user 表总行数、pageSize 恒为 100、翻到第 2 页仍返回同一批数据。",
+      "impactScope": [
+        "SystemHandler.UserProfile",
+        "SystemHandler.UserProfilePage",
+        "SystemHandler.ProjectMemberList",
+        "SystemHandler.ProjectMemberOptions",
+        "SystemHandler.UserRoleProjectList",
+        "internal/handler/system.go:571-636",
+        "table: user",
+        "table: user_role"
+      ],
+      "strategy": "两条用例：(a) 不带头 GET /user/profile，断言 401 / code=100401，当前实现返回 200 且 data.id=\"admin\"；(b) 造 p1/p2 两个项目与分属 o1/o2 的用户，POST /system/project/member-list {\"projectId\":\"p1\"}，断言列表只含属于 p1 的成员、roleName 来自 user_role_relation 而非硬编码，且 current/pageSize 回显请求值。",
+      "verificationChecklist": [
+        "匿名 /user/profile 返回 401 而非 admin 资料行",
+        "无法识别的 token 访问 /user/profile 返回 401 而非零值 user 对象",
+        "POST /system/project/member-list 的返回严格受 projectId 约束，不出现其他项目/组织用户",
+        "member-list 的 roleName 来自库表，total 等于真实成员数，current/pageSize 回显请求参数",
+        "POST /user/profile/page 与 POST /user/role/project/list 不返回与请求上下文无关的全表数据"
+      ],
+      "cases": [
+        {
+          "id": "tc-user-profile-01",
+          "name": "test_UserProfile_Anonymous_MustNotReturnAdmin",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBUserProfile(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestUserProfile_Anonymous_MustNotReturnAdmin(t *testing.T) {\n\tdb := setupDBUserProfile(t)\n\tif err := db.Exec(\"DELETE FROM `user`\").Error; err != nil {\n\t\tt.Fatalf(\"clean user: %v\", err)\n\t}\n\tif err := db.Create(&model.User{ID: \"admin\", Name: \"Administrator\", Email: \"admin@trueone.io\", Phone: \"13800000000\", Enable: model.BitBool(true), Deleted: model.BitBool(false), LastOrganizationID: \"100001\", LastProjectID: \"100001100001\"}).Error; err != nil {\n\t\tt.Fatalf(\"seed admin: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodGet, \"/user/profile\", nil)\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar got struct {\n\t\tCode int `json:\"code\"`\n\t\tData struct {\n\t\t\tID    string `json:\"id\"`\n\t\t\tEmail string `json:\"email\"`\n\t\t\tPhone string `json:\"phone\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {\n\t\tt.Fatalf(\"unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif w.Code != http.StatusUnauthorized || got.Code != 100401 {\n\t\tt.Fatalf(\"anonymous /user/profile must be 401/100401, got http=%d code=%d body=%s\", w.Code, got.Code, w.Body.String())\n\t}\n\tif got.Data.ID != \"\" {\n\t\tt.Fatalf(\"anonymous caller received profile of %q email=%q phone=%q\", got.Data.ID, got.Data.Email, got.Data.Phone)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "w.Code == 401 且 body.code == 100401 且 body.data.id == \"\"；当前实现为 http=200、code=200、data.id=\"admin\"、data.email=\"admin@trueone.io\"",
+            "dbStateDiff": "[READ-ONLY] no write expected（夹具 INSERT INTO user(id,name,email,phone,enable,deleted,last_organization_id,last_project_id)）",
+            "traceLog": "HTTP 200（期望 401）；无 UNAUTHORIZED 日志，说明兜底分支 userId=\"admin\" 被静默执行"
+          }
+        },
+        {
+          "id": "tc-user-profile-02",
+          "name": "test_ProjectMemberList_MustRespectProjectID",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBProjectMember(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestProjectMemberList_MustRespectProjectID(t *testing.T) {\n\tdb := setupDBProjectMember(t)\n\tif err := db.Exec(\"DELETE FROM `user`\").Error; err != nil {\n\t\tt.Fatalf(\"clean user: %v\", err)\n\t}\n\tif err := db.Exec(\"DELETE FROM project\").Error; err != nil {\n\t\tt.Fatalf(\"clean project: %v\", err)\n\t}\n\tif err := db.Create(&model.Project{ID: \"p1\", OrganizationID: \"o1\", Name: \"P1\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed p1: %v\", err)\n\t}\n\tif err := db.Create(&model.Project{ID: \"p2\", OrganizationID: \"o2\", Name: \"P2\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed p2: %v\", err)\n\t}\n\tif err := db.Create(&model.User{ID: \"u-outsider\", Name: \"Outsider\", Email: \"outsider@o2.io\", Enable: model.BitBool(true), Deleted: model.BitBool(false), LastOrganizationID: \"o2\", LastProjectID: \"p2\"}).Error; err != nil {\n\t\tt.Fatalf(\"seed outsider: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodPost, \"/system/project/member-list\", strings.NewReader(`{\"projectId\":\"p1\"}`))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar got struct {\n\t\tCode int `json:\"code\"`\n\t\tData struct {\n\t\t\tList []struct {\n\t\t\t\tID       string `json:\"id\"`\n\t\t\t\tRoleName string `json:\"roleName\"`\n\t\t\t} `json:\"list\"`\n\t\t\tTotal    int64 `json:\"total\"`\n\t\t\tCurrent  int   `json:\"current\"`\n\t\t\tPageSize int   `json:\"pageSize\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {\n\t\tt.Fatalf(\"unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tfor _, m := range got.Data.List {\n\t\tif m.ID == \"u-outsider\" {\n\t\t\tt.Fatalf(\"p1 member list leaked u-outsider of organization o2; total=%d pageSize=%d (projectId ignored)\", got.Data.Total, got.Data.PageSize)\n\t\t}\n\t}\n\tif got.Data.Current != 1 || got.Data.PageSize != 10 {\n\t\tt.Fatalf(\"pagination metadata not echoed: current=%d pageSize=%d\", got.Data.Current, got.Data.PageSize)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "响应 data.list 中不存在 id == \"u-outsider\"（该用户 LastProjectID=p2、LastOrganizationID=o2），且 data.current==1、data.pageSize==10 回显请求；当前实现返回 u-outsider 且 pageSize 恒为 100",
+            "dbStateDiff": "[READ-ONLY] no write expected（夹具：2 行 project + 1 行 user）",
+            "traceLog": "HTTP 200；data.total 等于 user 表行数而非 p1 成员数"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无任何测试文件；ProjectMemberList 的 projectId 参数从未参与查询，属于需要基线锁定的越权面",
+        "onlineMonitoring": "对 /project/member/* 与 /system/project/member-list 统计返回条数：单项目返回条数等于全库用户数即告警；同时对比同一 projectId 在不同组织上下文下的返回集合"
+      }
+    }
+  },
+  {
+    "id": "sec-global-permission",
+    "sectionNumber": "7.3",
+    "lineStart": 706,
+    "lineEnd": 837,
+    "title": "全局角色权限树读取与保存",
+    "paragraphs": [
+      "GlobalPermissionSetting（GET /user/role/global/permission/setting/:roleId）用 c.Param(\"roleId\") 读取角色，按 user_role_permission 匹配 role_id；roleID == \"admin\" 时恒返回全开，len(rolePerms) == 0 时只放开 strings.HasSuffix(permID, \":READ\") 的权限；返回节点 TreeItem 的 Children []TreeItem 带 json:\"children,omitempty\" 而代码从不填充，JSON 中不存在 children 键。",
+      "GlobalPermissionUpdate（POST /user/role/global/permission/update）只绑定 json:\"userRoleId\"，而前端 MeterSphere 契约使用 roleId；字段名不匹配时 body.UserRoleID 为空串，代码对每个 enable=true 的权限执行 Where(\"role_id = ? AND permission_id = ?\", \"\", p.ID).Count() 后 Create(&newPerm)，于是写出一批 role_id = '' 的孤儿权限行，接口仍返回 \"更新成功\"。",
+      "写权限采用 Count 后 Create 的非原子读改写，user_role_permission 没有 (role_id, permission_id) 唯一索引，双击或重试即产生重复行；p.Enable=false 走 Delete(&model.UserRolePermission{}) 物理删除，与 enable=true 的语义不对称，也没有审计明细记录具体改了哪些权限。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-global-permission",
+      "title": "roleId/userRoleId 字段名不匹配导致静默 no-op 与孤儿权限行，并发重复插入",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/幂等缺失/数据污染",
+      "riskDescription": "按前端真实报文接入的开发者会以为权限保存成功：接口 200 且 message=\"更新成功\"，但库里只多出 role_id='' 的垃圾行，目标角色一条权限都没变，重新进入设置页仍是默认值（非 admin 角色只显示 READ 勾选）。症状：SELECT * FROM user_role_permission WHERE role_id='' 非空，GET /user/role/global/permission/setting/member 的 CASE:WRITE 仍为 false；双击保存产生两条相同 (role_id, permission_id)。另外 children 键缺失会让依赖 node.children 做递归渲染的树组件拿到 undefined 直接报错或渲染空白，属于响应形状二次破坏。",
+      "impactScope": [
+        "SystemHandler.GlobalPermissionSetting",
+        "SystemHandler.GlobalPermissionUpdate",
+        "internal/handler/system.go:706-837",
+        "table: user_role_permission",
+        "table: user_role",
+        "internal/router/router.go:152-153"
+      ],
+      "strategy": "对非 admin 角色（bootstrap 的 member）：POST {\"roleId\":\"member\",\"permissions\":[{\"id\":\"CASE:WRITE\",\"enable\":true}]}，断言 200 后 user_role_permission 存在 (member, CASE:WRITE) 且不存在 role_id='' 的行；随后 GET setting 断言 CASE:WRITE.enable == true。再用两个 goroutine 各发 10 次相同请求，断言 (member, CASE:WRITE) 行数恒为 1。",
+      "verificationChecklist": [
+        "POST /user/role/global/permission/update 同时接受 roleId 与 userRoleId，或在两者均缺失时返回 code=400 而非静默成功",
+        "更新后 user_role_permission 中不存在 role_id 为空串的行",
+        "enable=true 的权限在 user_role_permission 有且仅有一行（(role_id, permission_id) 唯一约束或 upsert）",
+        "GET permission/setting 回读的 enable 与刚保存的一致，非 admin 角色也一致",
+        "权限树节点包含 children 键（缺失语义需与前端核对并写进契约测试）"
+      ],
+      "cases": [
+        {
+          "id": "tc-global-permission-01",
+          "name": "test_GlobalPermissionUpdate_MustPersistForRoleIDContract",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBGlobalPerm(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestGlobalPermissionUpdate_MustPersistForRoleIDContract(t *testing.T) {\n\tdb := setupDBGlobalPerm(t)\n\tif err := db.Exec(\"DELETE FROM user_role_permission\").Error; err != nil {\n\t\tt.Fatalf(\"clean permission: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodPost, \"/user/role/global/permission/update\", strings.NewReader(`{\"roleId\":\"member\",\"permissions\":[{\"id\":\"CASE:WRITE\",\"enable\":true}]}`))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar upd struct {\n\t\tCode    int    `json:\"code\"`\n\t\tMessage string `json:\"message\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &upd); err != nil {\n\t\tt.Fatalf(\"unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif upd.Code != 200 {\n\t\tt.Fatalf(\"update rejected: %s\", w.Body.String())\n\t}\n\n\tvar orphan int64\n\tif err := db.Model(&model.UserRolePermission{}).Where(\"role_id = ?\", \"\").Count(&orphan).Error; err != nil {\n\t\tt.Fatalf(\"count orphan: %v\", err)\n\t}\n\tif orphan != 0 {\n\t\tt.Fatalf(\"update returned success but wrote %d row(s) with empty role_id (roleId/userRoleId 字段名不匹配)\", orphan)\n\t}\n\n\tvar persisted int64\n\tif err := db.Model(&model.UserRolePermission{}).Where(\"role_id = ? AND permission_id = ?\", \"member\", \"CASE:WRITE\").Count(&persisted).Error; err != nil {\n\t\tt.Fatalf(\"count persisted: %v\", err)\n\t}\n\tif persisted != 1 {\n\t\tt.Fatalf(\"permission CASE:WRITE not persisted for role member (rows=%d, update=%s)\", persisted, w.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "upd.Code == 200 且 SELECT count(*) FROM user_role_permission WHERE role_id='' == 0 且 (role_id='member' AND permission_id='CASE:WRITE') 行数 == 1；当前实现 orphan==1、persisted==0",
+            "dbStateDiff": "+1 行 user_role_permission(role_id='member', permission_id='CASE:WRITE')；当前实现为 +1 行 (role_id='', permission_id='CASE:WRITE')（错误租户维度写入）",
+            "traceLog": "HTTP 200 / code 200 / message=\"更新成功\"（与实际未生效不一致）；并发场景下 user_role_permission 出现重复行数 > 1"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件，且前端字段名与后端 binding tag 的差异没有任何契约断言守护",
+        "onlineMonitoring": "定时巡检 SELECT count(*) FROM user_role_permission WHERE role_id='' 与 (role_id, permission_id) 重复组，出现即告警；同时统计 permission/update 的 200 响应数与表行数增量是否匹配"
+      }
+    }
+  },
+  {
+    "id": "sec-global-group-member",
+    "sectionNumber": "7.4",
+    "lineStart": 839,
+    "lineEnd": 866,
+    "title": "全局用户组成员下拉、添加成员与移除角色关系",
+    "paragraphs": [
+      "GlobalUserGroupMemberOption（GET /user/role/relation/global/user/option/:roleId）忽略 :roleId，返回 user 表全部 deleted = 0 用户的 {id,name,email}，不排除已是该角色成员的用户。",
+      "GlobalUserGroupAddMember（POST /user/role/relation/global/add）函数体只有 response.Success(c, \"添加成功\")，不解析请求体、不写 user_role_relation，是纯桩。",
+      "GlobalUserGroupDeleteMember（GET /user/role/relation/global/delete/:relationId）执行 config.DB.Where(\"id = ?\", relationId).Delete(&model.UserRoleRelation{})：UserRoleRelation 无 deleted 字段，属物理删除；id 仅来自路径参数，没有 scope_id/role_id 归属校验，也不写审计日志。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-global-group-member",
+      "title": "移除角色关系可匿名物理删除任意用户的任意角色，加成员为纯桩",
+      "riskLevel": "P0",
+      "riskTag": "越权/契约破坏",
+      "riskDescription": "任何调用方只要拿到（或猜到）user_role_relation.id 即可物理删除任意组织、任意用户的角色关系——包括 bootstrap 写入的 admin 的 admin/org_admin 关系（id 形如 rel-<role>-<ts>），删完后该用户权限静默消失且无审计痕迹；而加成员是空实现，形成“加不进、删得掉”的不对称，前端提示成功但列表不变，测试人员会误判为筛选或缓存问题。可观察症状：curl -X GET '.../user/role/relation/global/delete/rel-admin-victim' 返回 {\"code\":200,\"message\":\"success\",\"data\":\"移除成功\"} 且 user_role_relation 行数 -1；随后 POST /user/role/relation/global/add 返回 200 但行数不变。",
+      "impactScope": [
+        "SystemHandler.GlobalUserGroupMemberOption",
+        "SystemHandler.GlobalUserGroupAddMember",
+        "SystemHandler.GlobalUserGroupDeleteMember",
+        "internal/handler/system.go:839-866",
+        "internal/router/router.go:154-156",
+        "internal/service/bootstrap.go:125-145",
+        "table: user_role_relation"
+      ],
+      "strategy": "1) 用 bootstrap 数据记录 user_role_relation 行数与 admin 的角色集合；2) 不带任何鉴权头 GET /user/role/relation/global/delete/<admin 的 relation.id>，断言 401 且行数不变（当前实现 200 且行数 -1）；3) POST /user/role/relation/global/add {\"roleId\":\"member\",\"userIds\":[\"admin\"]} 断言新增 (admin, member) 一行（当前 0 行）。",
+      "verificationChecklist": [
+        "移除角色关系必须校验操作者对该 role/scope 的管理权限，且匿名调用被拒绝",
+        "delete 后 user_role_relation 行数变化与返回体一致，并写入 operation_log(module=SYSTEM, type=DELETE)",
+        "add-member 落库 user_role_relation，重复提交同一 (user_id, role_id) 不产生重复行",
+        "member option 排除已成为该角色成员的用户，且响应为 [] 而非 null",
+        "admin 的系统级关系不允许被普通组织/项目管理员删除"
+      ],
+      "cases": [
+        {
+          "id": "tc-global-group-member-01",
+          "name": "test_GlobalUserGroupDeleteMember_Anonymous_MustNotDeleteRelation",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBGroupMember(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestGlobalUserGroupDeleteMember_Anonymous_MustNotDeleteRelation(t *testing.T) {\n\tdb := setupDBGroupMember(t)\n\tif err := db.Exec(\"DELETE FROM user_role_relation\").Error; err != nil {\n\t\tt.Fatalf(\"clean relation: %v\", err)\n\t}\n\tif err := db.Create(&model.UserRoleRelation{ID: \"rel-admin-victim\", UserID: \"admin\", RoleID: \"admin\", SourceID: \"system\", CreatedAt: 1700000000000}).Error; err != nil {\n\t\tt.Fatalf(\"seed relation: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodGet, \"/user/role/relation/global/delete/rel-admin-victim\", nil)\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar after int64\n\tif err := db.Model(&model.UserRoleRelation{}).Where(\"id = ?\", \"rel-admin-victim\").Count(&after).Error; err != nil {\n\t\tt.Fatalf(\"count relation: %v\", err)\n\t}\n\tif after != 1 {\n\t\tt.Fatalf(\"anonymous call deleted user_role_relation rel-admin-victim (http=%d code path=GlobalUserGroupDeleteMember body=%s)\", w.Code, w.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "DELETE 后 SELECT count(*) FROM user_role_relation WHERE id='rel-admin-victim' == 1（未被删除）；当前实现为 0，且 HTTP 200 / data=\"移除成功\"",
+            "dbStateDiff": "[READ-ONLY] no write expected；当前实现为 -1 行 user_role_relation 物理删除（无软删除字段）",
+            "traceLog": "HTTP 200，无鉴权失败日志，无 operation_log 记录"
+          }
+        },
+        {
+          "id": "tc-global-group-member-02",
+          "name": "test_GlobalUserGroupAddMember_MustPersistRelation",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBGroupAdd(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestGlobalUserGroupAddMember_MustPersistRelation(t *testing.T) {\n\tdb := setupDBGroupAdd(t)\n\tif err := db.Exec(\"DELETE FROM user_role_relation\").Error; err != nil {\n\t\tt.Fatalf(\"clean relation: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodPost, \"/user/role/relation/global/add\", strings.NewReader(`{\"roleId\":\"member\",\"userIds\":[\"admin\"]}`))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\treq.Header.Set(\"X-AUTH-TOKEN\", \"stub-session\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar n int64\n\tif err := db.Model(&model.UserRoleRelation{}).Where(\"user_id = ? AND role_id = ?\", \"admin\", \"member\").Count(&n).Error; err != nil {\n\t\tt.Fatalf(\"count relation: %v\", err)\n\t}\n\tif n != 1 {\n\t\tt.Fatalf(\"add-member returned http=%d body=%s but inserted %d user_role_relation row(s)\", w.Code, w.Body.String(), n)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "SELECT count(*) FROM user_role_relation WHERE user_id='admin' AND role_id='member' == 1；当前实现为 0（函数体只有 response.Success(c, \"添加成功\")）",
+            "dbStateDiff": "+1 行 user_role_relation(id=生成值, user_id='admin', role_id='member', created_at=毫秒时间戳)；当前实现无任何写操作",
+            "traceLog": "HTTP 200 / data=\"添加成功\" 与实际 0 行不一致；无 audit 记录"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；该写接口是纯桩而删除接口是物理删除，两者都需要先建立回归基线才能安全改造",
+        "onlineMonitoring": "对 /user/role/relation/global/delete/* 的 QPS 与 user_role_relation 行数下降做联动告警；对 add 接口的 200 响应数与表行数增量不一致（长期为 0 增量）告警"
+      }
+    }
+  },
+  {
+    "id": "sec-system-org-list",
+    "sectionNumber": "7.5",
+    "lineStart": 153,
+    "lineEnd": 218,
+    "title": "系统组织统计与组织分页列表",
+    "paragraphs": [
+      "OrganizationTotal（GET /system/organization/total）返回 {organizationTotal, projectTotal}，两个 Count 都带 deleted = 0 过滤。",
+      "OrganizationList（POST /system/organization/list 与 POST /system/organization/page）ShouldBindJSON 的错误被丢弃、Current/PageSize 仅 <=0 兜底、Keyword 走 name LIKE ?；OrgTableItem 的 MemberCount 恒为常量 1，ProjectCount 通过逐行 config.DB.Model(&model.Project{}).Where(\"organization_id = ? AND deleted = 0\", o.ID).Count 得到。",
+      "响应封装 response.SuccessPage 的 PageResult 中 Current/PageSize/TotalPages 都带 json 的 omitempty：当 total = 0 时 totalPages 计算结果为 0 会被整个键省略；OrganizationList 也始终不回显 requested 之外的页信息。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-system-org-list",
+      "title": "分页元数据 totalPages 在空结果时缺失，memberCount 恒为 1",
+      "riskLevel": "P1",
+      "riskTag": "分页元数据错误/契约破坏",
+      "riskDescription": "空库或筛选无结果时前端拿到的是 {\"list\":[],\"total\":0,\"current\":1,\"pageSize\":10}，data.totalPages 为 undefined，按 totalPages 渲染页码或 v-for 的组件要么空白要么出现 NaN；memberCount 恒为常量 1 会让组织列表永远显示“1 人”，即使该组织有 30 个成员，测试/运维据此误判成员数据，也会掩盖成员关系丢失类故障。可观察症状：POST /system/organization/list {\"current\":1,\"pageSize\":10} 在无组织数据时响应体不含 totalPages 键；有组织时每行 memberCount 恒为 1。",
+      "impactScope": [
+        "SystemHandler.OrganizationTotal",
+        "SystemHandler.OrganizationList",
+        "internal/handler/system.go:153-218",
+        "internal/response/response.go:39-55",
+        "table: organization",
+        "table: project",
+        "table: user_role_relation"
+      ],
+      "strategy": "1) 清空 organization 后 POST /system/organization/list {}，断言响应体包含 totalPages 且等于 0（当前键缺失）；2) 造 1 个组织 + 3 条 user_role_relation(role_id='org_admin', source_id=<org>)，断言该行 memberCount == 3（当前恒为 1）；3) 断言 projectCount 与 SELECT count(*) FROM project WHERE organization_id=? AND deleted=0 相等。",
+      "verificationChecklist": [
+        "total=0 时 data.totalPages 键仍存在且为 0",
+        "memberCount 由 user/user_role_relation 真实聚合得出，而非常量 1",
+        "projectCount 与 project 表条件计数一致（含 deleted=0 与 enable 语义）",
+        "current/pageSize 回显请求值，越界页返回空 list 而非第一页数据",
+        "OrganizationTotal 的 organizationTotal/projectTotal 与两表 deleted=0 计数一致"
+      ],
+      "cases": [
+        {
+          "id": "tc-system-org-list-01",
+          "name": "test_OrganizationList_MemberCountIsRealAndTotalPagesPresent",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBOrgList(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestOrganizationList_MemberCountIsRealAndTotalPagesPresent(t *testing.T) {\n\tdb := setupDBOrgList(t)\n\tif err := db.Exec(\"DELETE FROM organization\").Error; err != nil {\n\t\tt.Fatalf(\"clean organization: %v\", err)\n\t}\n\tif err := db.Exec(\"DELETE FROM user_role_relation\").Error; err != nil {\n\t\tt.Fatalf(\"clean relation: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\tpost := func(path string) *httptest.ResponseRecorder {\n\t\treq := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{\"current\":1,\"pageSize\":10}`))\n\t\treq.Header.Set(\"Content-Type\", \"application/json\")\n\t\tw := httptest.NewRecorder()\n\t\tr.ServeHTTP(w, req)\n\t\treturn w\n\t}\n\n\tempty := post(\"/system/organization/list\")\n\tif !strings.Contains(empty.Body.String(), `\"totalPages\"`) {\n\t\tt.Fatalf(\"total=0 response omits totalPages key (omitempty drops 0): %s\", empty.Body.String())\n\t}\n\n\tif err := db.Create(&model.Organization{ID: \"o1\", Name: \"Org One\", Enable: model.BitBool(true), Deleted: model.BitBool(false), CreatedAt: 1700000000000}).Error; err != nil {\n\t\tt.Fatalf(\"seed organization: %v\", err)\n\t}\n\tfor _, uid := range []string{\"u1\", \"u2\", \"u3\"} {\n\t\tif err := db.Create(&model.UserRoleRelation{ID: \"rel-\" + uid, UserID: uid, RoleID: \"org_admin\", SourceID: \"o1\", CreatedAt: 1700000000000}).Error; err != nil {\n\t\t\tt.Fatalf(\"seed relation %s: %v\", uid, err)\n\t\t}\n\t}\n\n\tvar got struct {\n\t\tCode int `json:\"code\"`\n\t\tData struct {\n\t\t\tList []struct {\n\t\t\t\tID          string `json:\"id\"`\n\t\t\t\tMemberCount int    `json:\"memberCount\"`\n\t\t\t} `json:\"list\"`\n\t\t\tTotal      int64 `json:\"total\"`\n\t\t\tTotalPages int64 `json:\"totalPages\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(post(\"/system/organization/list\").Body.Bytes(), &got); err != nil {\n\t\tt.Fatalf(\"unmarshal: %v\", err)\n\t}\n\tif len(got.Data.List) != 1 {\n\t\tt.Fatalf(\"want 1 organization row, got %+v\", got.Data.List)\n\t}\n\tif got.Data.List[0].MemberCount != 3 {\n\t\tt.Fatalf(\"memberCount is not aggregated from user_role_relation: got %d, want 3\", got.Data.List[0].MemberCount)\n\t}\n\tif got.Data.TotalPages != 1 {\n\t\tt.Fatalf(\"totalPages wrong for total=1 pageSize=10: got %d, want 1\", got.Data.TotalPages)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "空结果响应体包含 \"totalPages\"（期望 totalPages=0）；o1 行 memberCount == 3（聚合 source_id='o1' 且 role_id='org_admin' 的 3 条关系）；当前实现 totalPages 键缺失、memberCount == 1",
+            "dbStateDiff": "[READ-ONLY] no write expected（夹具：1 行 organization + 3 行 user_role_relation）",
+            "traceLog": "HTTP 200；两次 POST 均返回 code=200，分页字段 current=1 pageSize=10"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；SuccessPage 的 omitempty 行为属于跨所有分页接口的通用契约，需要一条最小用例固定",
+        "onlineMonitoring": "前端埋点捕获 data.totalPages === undefined 的比例，>0 即告警；后端巡检 organization 列表 memberCount 分布（长期恒为 1 说明是常量而非聚合）"
+      }
+    }
+  },
+  {
+    "id": "sec-system-org-write",
+    "sectionNumber": "7.6",
+    "lineStart": 463,
+    "lineEnd": 562,
+    "title": "系统组织增改删、启停与恢复写操作",
+    "paragraphs": [
+      "SystemOrgAdd（POST /system/organization/add）用 ID: fmt.Sprintf(\"%d\", time.Now().UnixMilli()) 生成主键，CreateUser 硬编码 \"admin\"；config.DB.Create(&org) 的 error 未检查，随后 RecordAuditLog(c, ModuleSystem, OpTypeAdd, org.ID, ...) 照记成功。",
+      "SystemOrgUpdate（POST /system/organization/update）与 SystemOrgRename（POST /system/organization/rename）用 Updates(map[string]interface{}{...}) 把 name/description 无条件写库（请求体缺字段时按空串覆盖），Where(\"id = ?\", body.ID) 没有 deleted = 0 条件，对已软删除的组织同样生效。",
+      "SystemOrgDelete/SystemOrgEnable/SystemOrgDisable/SystemOrgRevoke 只改 deleted/enable 标志（model.BitBool），既不校验目标组织是否存在，也不级联处理 project.organization_id、user_role_relation.source_id 等引用；对应路由是 GET /system/organization/{delete,enable,disable,recover}/:id，状态变更走 GET。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-system-org-write",
+      "title": "UnixMilli 主键冲突 + Create 错误被忽略，空值覆盖与软删除组织可写",
+      "riskLevel": "P1",
+      "riskTag": "幂等/数据污染/状态机",
+      "riskDescription": "同一毫秒内的两个创建请求会得到相同主键：第二次 Create 因主键冲突失败但错误被丢弃，接口仍返回 code 200 与同一 id，调用方以为建了两个组织，实际只有一条（前端双击或客户端重试即复现），且返回体里的 id 指向已存在的行，后续按 id 更新的对象错位。Update/Rename 传空 name 会把组织名清空（空串覆盖），且能改到已软删除的组织，破坏软删除语义与“已删除不可写”的状态机约束；删除组织不处理其下项目与角色关系，project.organization_id 变成悬空引用，前端按组织查项目时出现“幽灵项目”。可观察症状：连续两次 POST /system/organization/add 后 SELECT count(*) FROM organization WHERE name='X' = 1 而两次都返回 200；POST /system/organization/update {\"id\":\"o1\"} 后 SELECT name FROM organization WHERE id='o1' 为空串。",
+      "impactScope": [
+        "SystemHandler.SystemOrgAdd",
+        "SystemHandler.SystemOrgUpdate",
+        "SystemHandler.SystemOrgRename",
+        "SystemHandler.SystemOrgDelete",
+        "SystemHandler.SystemOrgEnable",
+        "SystemHandler.SystemOrgDisable",
+        "SystemHandler.SystemOrgRevoke",
+        "internal/handler/system.go:463-562",
+        "internal/router/router.go:161-169",
+        "table: organization",
+        "table: project",
+        "table: user_role_relation"
+      ],
+      "strategy": "1) 造活跃组织 o1(name=Keep)，POST /system/organization/update {\"id\":\"o1\"}（不带 name），断言 organization.name 仍为 Keep；2) 造 deleted=1 的 o2(name=Gone)，POST /system/organization/update {\"id\":\"o2\",\"name\":\"Hacked\"}，断言 name 仍为 Gone；3) 同一毫秒内向 /system/organization/add 连发两次同名请求，断言返回的 id 互不相同且 organization 行数 +2；4) GET /system/organization/delete/<o1> 后断言其下 project 与 user_role_relation 被同步处理，或接口返回冲突错误。",
+      "verificationChecklist": [
+        "同一毫秒内两次 add 必须产生 2 行且 id 唯一（Create error 必须返回非 200）",
+        "部分更新语义：请求体未提供的字段不得被空值覆盖",
+        "update/rename/delete/enable/disable 必须带 deleted = 0 条件或显式返回 404",
+        "删除/禁用组织时其下 project、user_role_relation 的引用一致性有明确策略（级联或拒绝）",
+        "状态变更接口不接受 GET（或至少校验鉴权与 CSRF 语义）"
+      ],
+      "cases": [
+        {
+          "id": "tc-system-org-write-01",
+          "name": "test_SystemOrgUpdate_NoEmptyOverwrite_NoDeletedTarget",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBOrgWrite(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestSystemOrgUpdate_NoEmptyOverwrite_NoDeletedTarget(t *testing.T) {\n\tdb := setupDBOrgWrite(t)\n\tif err := db.Exec(\"DELETE FROM organization\").Error; err != nil {\n\t\tt.Fatalf(\"clean organization: %v\", err)\n\t}\n\tif err := db.Create(&model.Organization{ID: \"o1\", Name: \"Keep\", Description: \"keep\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed o1: %v\", err)\n\t}\n\tif err := db.Create(&model.Organization{ID: \"o2\", Name: \"Gone\", Enable: model.BitBool(true), Deleted: model.BitBool(true)}).Error; err != nil {\n\t\tt.Fatalf(\"seed o2: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\tpost := func(path string, payload string) *httptest.ResponseRecorder {\n\t\treq := httptest.NewRequest(http.MethodPost, path, strings.NewReader(payload))\n\t\treq.Header.Set(\"Content-Type\", \"application/json\")\n\t\tw := httptest.NewRecorder()\n\t\tr.ServeHTTP(w, req)\n\t\treturn w\n\t}\n\n\tpost(\"/system/organization/update\", `{\"id\":\"o1\"}`)\n\tvar o1 model.Organization\n\tif err := db.Where(\"id = ?\", \"o1\").First(&o1).Error; err != nil {\n\t\tt.Fatalf(\"reload o1: %v\", err)\n\t}\n\tif o1.Name != \"Keep\" {\n\t\tt.Fatalf(\"partial update blanked organization name: got %q, want %q\", o1.Name, \"Keep\")\n\t}\n\n\tpost(\"/system/organization/update\", `{\"id\":\"o2\",\"name\":\"Hacked\"}`)\n\tvar o2 model.Organization\n\tif err := db.Where(\"id = ?\", \"o2\").First(&o2).Error; err != nil {\n\t\tt.Fatalf(\"reload o2: %v\", err)\n\t}\n\tif o2.Name != \"Gone\" {\n\t\tt.Fatalf(\"soft-deleted organization was mutated: got %q, want %q\", o2.Name, \"Gone\")\n\t}\n}\n",
+          "evidence": {
+            "assertion": "o1.Name == \"Keep\" 且 o2.Name == \"Gone\"；当前实现 o1.Name == \"\"（空串覆盖）、o2.Name == \"Hacked\"（未过滤 deleted=0）",
+            "dbStateDiff": "[READ-ONLY] no write expected；当前实现为 UPDATE organization SET name='',description='',updated_at=? WHERE id='o1' 与 UPDATE organization SET name='Hacked' WHERE id='o2'",
+            "traceLog": "两次 POST 均 HTTP 200 / data=\"ok\"；operation_log 各 +1 条（module=SYSTEM）"
+          }
+        },
+        {
+          "id": "tc-system-org-write-02",
+          "name": "test_SystemOrgAdd_SameMillisecondMustNotCollide",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBOrgAdd(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestSystemOrgAdd_SameMillisecondMustNotCollide(t *testing.T) {\n\tdb := setupDBOrgAdd(t)\n\tif err := db.Exec(\"DELETE FROM organization\").Error; err != nil {\n\t\tt.Fatalf(\"clean organization: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\tids := make(map[string]bool, 2)\n\tfor i := 0; i < 2; i++ {\n\t\treq := httptest.NewRequest(http.MethodPost, \"/system/organization/add\", strings.NewReader(`{\"name\":\"DupOrg\"}`))\n\t\treq.Header.Set(\"Content-Type\", \"application/json\")\n\t\tw := httptest.NewRecorder()\n\t\tr.ServeHTTP(w, req)\n\t\tvar got struct {\n\t\t\tCode int                `json:\"code\"`\n\t\t\tData model.Organization `json:\"data\"`\n\t\t}\n\t\tif err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {\n\t\t\tt.Fatalf(\"unmarshal: %v body=%s\", err, w.Body.String())\n\t\t}\n\t\tif got.Code != 200 {\n\t\t\tt.Fatalf(\"add #%d failed: %s\", i, w.Body.String())\n\t\t}\n\t\tids[got.Data.ID] = true\n\t}\n\n\tvar rows int64\n\tif err := db.Model(&model.Organization{}).Where(\"name = ?\", \"DupOrg\").Count(&rows).Error; err != nil {\n\t\tt.Fatalf(\"count organization: %v\", err)\n\t}\n\tif int64(len(ids)) != rows || rows != 2 {\n\t\tt.Fatalf(\"two successful adds produced %d row(s) with %d distinct id(s): UnixMilli 主键冲突 + Create error 被忽略\", rows, len(ids))\n\t}\n}\n",
+          "evidence": {
+            "assertion": "len(ids) == 2 且 SELECT count(*) FROM organization WHERE name='DupOrg' == 2；当前实现为 1 行、1 个 id（两次都返回 200）",
+            "dbStateDiff": "+2 行 organization；当前实现为 +1 行（第二次 INSERT 主键冲突，err 被丢弃）",
+            "traceLog": "两次 HTTP 200 / code=200 / data.id 相同；operation_log 出现 2 条“创建组织: DupOrg”但真实组织只有 1 个（审计与实际不一致）"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；毫秒级主键生成与忽略 Create error 是组织/项目两类写接口的共性问题，需要统一基线用例",
+        "onlineMonitoring": "对 organization/project 表新增行数与 add 接口 200 响应数做差值告警；巡检 updated_at 变更但 name 为空的 organization 行"
+      }
+    }
+  },
+  {
+    "id": "sec-system-project",
+    "sectionNumber": "7.7",
+    "lineStart": 220,
+    "lineEnd": 444,
+    "title": "系统项目列表与项目增改删、启停、恢复",
+    "paragraphs": [
+      "SystemProjectList（POST /system/project/list 与 /system/project/page）返回 ProjectTableItem：MemberCount 恒为 1、OrgAdmins 恒为 defaultAdmins（{admin, Administrator}），OrganizationName 在 organization 表查不到时兜底写 \"默认组织\"。",
+      "SystemProjectAdd（POST /system/project/add）在 organizationId 为空时兜底 \"100001\"，ID 取 time.Now().UnixMilli()，Create 错误不检查；SystemProjectUpdate/Rename 允许修改 organization_id 与 name，Where(\"id = ?\", body.ID) 无 deleted = 0；Delete/Enable/Disable/Revoke 用 c.Param(\"id\")，路由为 GET /system/project/{delete,enable,disable,revoke}/:id。",
+      "SystemProjectUserList（GET /system/project/user-list）用 c.Query(\"keyword\") 读关键字，返回 user 全表用户的 {id,name,email} 选项，不含任何 project 维度过滤。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-system-project",
+      "title": "项目可通过 update 跨组织搬移，成员/管理员列恒为常量，用户选项无项目维度",
+      "riskLevel": "P1",
+      "riskTag": "越权/数据污染/契约破坏",
+      "riskDescription": "任何调用方都能用 POST /system/project/update {\"id\":\"p1\",\"organizationId\":\"o2\"} 把项目整体搬到别的组织（跨组织越权写，被搬项目在源组织列表瞬间消失），对已软删除项目同样生效；列表里 memberCount 恒 1、orgAdmins 恒为 Administrator，会让前端成员栏永久显示错误信息并掩盖成员关系丢失；SystemProjectUserList 不带项目参数，A 项目拉到的候选用户是全部账号，属于跨项目数据可见性扩大。可观察症状：搬移后 SELECT organization_id FROM project WHERE id='p1' 变为 o2；项目列表每行 memberCount:1、orgAdmins:[{\"id\":\"admin\",\"name\":\"Administrator\"}]，即使该项目有 20 个成员。",
+      "impactScope": [
+        "SystemHandler.SystemProjectList",
+        "SystemHandler.SystemProjectAdd",
+        "SystemHandler.SystemProjectUpdate",
+        "SystemHandler.SystemProjectRename",
+        "SystemHandler.SystemProjectDelete",
+        "SystemHandler.SystemProjectEnable",
+        "SystemHandler.SystemProjectDisable",
+        "SystemHandler.SystemProjectRevoke",
+        "SystemHandler.SystemProjectUserList",
+        "internal/handler/system.go:220-444",
+        "table: project",
+        "table: organization",
+        "table: user"
+      ],
+      "strategy": "1) 造 o1/p1 与 o2，POST /system/project/update {\"id\":\"p1\",\"organizationId\":\"o2\"}，断言 p1 仍属 o1 或返回越权错误；2) 造 deleted=1 的 p2，POST /system/project/rename {\"id\":\"p2\",\"name\":\"R\"} 断言不生效；3) 造真实成员关系后断言列表 memberCount/orgAdmins 来自库表；4) GET /system/project/user-list 断言受项目/组织上下文约束。",
+      "verificationChecklist": [
+        "POST /system/project/update 不允许把项目移动到调用者无权限的组织（或必须走显式迁移接口）",
+        "update/rename/delete 对 deleted=1 的项目不生效或返回 404",
+        "project list 的 memberCount 与 orgAdmins 来自真实关系表，不使用常量兜底",
+        "organizationName 缺失时返回空或显式错误，不伪造“默认组织”",
+        "SystemProjectUserList 受项目/组织上下文约束且分页可控"
+      ],
+      "cases": [
+        {
+          "id": "tc-system-project-01",
+          "name": "test_SystemProjectUpdate_MustNotMoveAcrossOrganization",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBProjectWrite(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestSystemProjectUpdate_MustNotMoveAcrossOrganization(t *testing.T) {\n\tdb := setupDBProjectWrite(t)\n\tif err := db.Exec(\"DELETE FROM project\").Error; err != nil {\n\t\tt.Fatalf(\"clean project: %v\", err)\n\t}\n\tif err := db.Create(&model.Organization{ID: \"o1\", Name: \"O1\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed o1: %v\", err)\n\t}\n\tif err := db.Create(&model.Organization{ID: \"o2\", Name: \"O2\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed o2: %v\", err)\n\t}\n\tif err := db.Create(&model.Project{ID: \"p1\", OrganizationID: \"o1\", Name: \"P1\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed p1: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodPost, \"/system/project/update\", strings.NewReader(`{\"id\":\"p1\",\"organizationId\":\"o2\"}`))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\treq.Header.Set(\"ORGANIZATION\", \"o1\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar p model.Project\n\tif err := db.Where(\"id = ?\", \"p1\").First(&p).Error; err != nil {\n\t\tt.Fatalf(\"reload p1: %v\", err)\n\t}\n\tif p.OrganizationID != \"o1\" {\n\t\tt.Fatalf(\"project moved across organizations via plain update: organization_id=%q (http=%d body=%s)\", p.OrganizationID, w.Code, w.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "SELECT organization_id FROM project WHERE id='p1' == \"o1\"；当前实现为 \"o2\"（越权跨组织搬移成功）",
+            "dbStateDiff": "[READ-ONLY] no write expected；当前实现为 UPDATE project SET organization_id='o2',updated_at=? WHERE id='p1'（无 organization 归属校验、无 deleted=0）",
+            "traceLog": "HTTP 200 / data=\"ok\"；operation_log 记录“修改项目: P1”，注意 Name 为空时 content 末尾为空串"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；项目的组织归属校验与成员聚合都未被任何断言覆盖",
+        "onlineMonitoring": "巡检 project.organization_id 不在 organization 表中的悬空行；对比 project 列表 memberCount 分布（恒为 1 说明是常量）"
+      }
+    }
+  },
+  {
+    "id": "sec-system-parameter",
+    "sectionNumber": "7.8",
+    "lineStart": 869,
+    "lineEnd": 946,
+    "title": "系统参数：邮件、清理策略、认证源与平台集成配置",
+    "paragraphs": [
+      "EmailInfo（GET /system/parameter/get/email-info）返回 {host:\"\",port:\"465\",account:\"\",from:\"\",ssl:\"true\",tsl:\"false\",recipient:\"\"}（键名沿用老系统 tsl），EmailInfoSave（POST /system/parameter/edit/email-info）只回 response.Success(c, \"保存成功\") 不落库，EmailTest（POST /system/parameter/test/email）无论入参如何都返回 \"测试连接成功\"。",
+      "CleanConfig（GET /system/parameter/get/clean-config）返回字符串 {\"operationLog\":\"30\",\"operationHistory\":\"30\"}，CleanConfigSave 同样只有成功响应；AuthSourceList（POST /system/authsource/list）返回 {total:0,list:[]}，PlatformInfo（GET /setting/get/platform/info）只给一条 LARK(enable:false)。",
+      "BaseInfo（GET /system/parameter/get/base-info）硬编码 url: \"http://localhost:5173\"、title: \"TrueOne Harness\"；LarkInfoWithDetail 的 callBack 同样硬编码 http://localhost:5173/login；LarkSave/LarkValidate/LarkEnable 全部只回字符串 \"保存成功\"/\"校验成功\"/\"更新成功\"。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-system-parameter",
+      "title": "配置类接口全是“保存成功”的假响应，EmailTest 恒成功，URL 硬编码 localhost",
+      "riskLevel": "P2",
+      "riskTag": "功能桩/契约破坏(边界)",
+      "riskDescription": "配置类接口全是不落库的桩：前端保存 SMTP 后立刻 GET 仍然拿到空 host，用户以为保存失败或反复点击；EmailTest 对任意 host/端口都报成功，会让联调方误判邮件通道可用（真实环境里会在上线后才发现发信不可用）。CleanConfig 用字符串而非数字，前端若做 value > 0 之类的比较会退化为 JS 字符串比较，边界行为与整型契约不一致；BaseInfo.url 写死 localhost:5173，换端口或换域名部署时前端拿到的后端地址错误，登录跳转/回调地址随之失效。可观察症状：POST /system/parameter/edit/email-info {\"host\":\"smtp.corp.io\"} 返回 200，随后 GET /system/parameter/get/email-info 的 data.host 仍为 \"\"。",
+      "impactScope": [
+        "SystemHandler.EmailInfo",
+        "SystemHandler.EmailInfoSave",
+        "SystemHandler.EmailTest",
+        "SystemHandler.CleanConfig",
+        "SystemHandler.CleanConfigSave",
+        "SystemHandler.AuthSourceList",
+        "SystemHandler.PlatformInfo",
+        "SystemHandler.LarkInfoWithDetail",
+        "SystemHandler.LarkSave",
+        "SystemHandler.LarkValidate",
+        "SystemHandler.LarkEnable",
+        "SystemHandler.BaseInfo",
+        "internal/handler/system.go:564-569",
+        "internal/handler/system.go:869-946"
+      ],
+      "strategy": "1) POST /system/parameter/edit/email-info 写入 host=smtp.corp.io，再 GET /system/parameter/get/email-info，断言 data.host 回读一致（当前恒为空串，证明无持久化）；2) POST /system/parameter/test/email 传非法 host 与空 account，断言返回失败或明确校验错误；3) 断言 CleanConfig 的 operationLog/operationHistory 为 JSON number；4) 断言 BaseInfo.url 来自配置而非硬编码 localhost:5173。",
+      "verificationChecklist": [
+        "EmailInfoSave 后 GET /system/parameter/get/email-info 能回读到写入值",
+        "EmailTest 对非法 host/端口/账号返回失败并带可读错误码",
+        "CleanConfig 的 operationLog/operationHistory 为数字类型（或前端确认接受字符串）",
+        "BaseInfo.url 由配置/请求 Host 推导，不硬编码 localhost:5173",
+        "AuthSourceList/PlatformInfo 的形状与前端契约一致（total/list 或数组）"
+      ],
+      "cases": [
+        {
+          "id": "tc-system-parameter-01",
+          "name": "test_EmailInfoSave_MustPersistAndBeReadable",
+          "lang": "go",
+          "filePath": "internal/handler/system_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupEnvParams(t *testing.T) {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tif _, err := config.InitDB(); err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n}\n\nfunc TestEmailInfoSave_MustPersistAndBeReadable(t *testing.T) {\n\tsetupEnvParams(t)\n\tr := router.SetupRouter()\n\n\tsave := httptest.NewRequest(http.MethodPost, \"/system/parameter/edit/email-info\", strings.NewReader(`{\"host\":\"smtp.corp.io\",\"port\":\"465\",\"account\":\"noreply@corp.io\",\"from\":\"noreply@corp.io\",\"ssl\":\"true\",\"tsl\":\"false\",\"recipient\":\"qa@corp.io\"}`))\n\tsave.Header.Set(\"Content-Type\", \"application/json\")\n\tsaveW := httptest.NewRecorder()\n\tr.ServeHTTP(saveW, save)\n\n\tvar saved struct {\n\t\tCode int `json:\"code\"`\n\t}\n\tif err := json.Unmarshal(saveW.Body.Bytes(), &saved); err != nil {\n\t\tt.Fatalf(\"unmarshal save: %v body=%s\", err, saveW.Body.String())\n\t}\n\tif saved.Code != 200 {\n\t\tt.Fatalf(\"save rejected: %s\", saveW.Body.String())\n\t}\n\n\tget := httptest.NewRequest(http.MethodGet, \"/system/parameter/get/email-info\", nil)\n\tgetW := httptest.NewRecorder()\n\tr.ServeHTTP(getW, get)\n\n\tvar got struct {\n\t\tCode int `json:\"code\"`\n\t\tData struct {\n\t\t\tHost    string `json:\"host\"`\n\t\t\tAccount string `json:\"account\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(getW.Body.Bytes(), &got); err != nil {\n\t\tt.Fatalf(\"unmarshal get: %v body=%s\", err, getW.Body.String())\n\t}\n\tif got.Data.Host != \"smtp.corp.io\" {\n\t\tt.Fatalf(\"email config not persisted: save=%s get.host=%q get.account=%q\", saveW.Body.String(), got.Data.Host, got.Data.Account)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "save.code == 200 且 get.data.host == \"smtp.corp.io\"；当前实现为 get.data.host == \"\"（EmailInfo 恒返回空模板）",
+            "dbStateDiff": "[READ-ONLY] no write expected（期望新增 1 行 email 配置或写入 system_parameter 键值），当前实现无任何持久化写入",
+            "traceLog": "两次 HTTP 200；save 的 message=\"success\"、data=\"保存成功\"，与 GET 返回的空配置矛盾"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；系统参数类接口在 mock 后端里全部是桩，缺少最小读写一致性用例",
+        "onlineMonitoring": "对配置类 GET 接口的返回值恒定不变（长期与写入请求无关联）做埋点告警；前端上报“保存后回读为空”的用户操作失败率"
+      }
+    }
+  },
+  {
+    "id": "sec-audit-log",
+    "sectionNumber": "7.9",
+    "lineStart": 31,
+    "lineEnd": 92,
+    "title": "操作审计日志统一记录 RecordAuditLog",
+    "paragraphs": [
+      "RecordAuditLog(c, module, opType, sourceID, content) 先从 c.Get(\"userId\") 取值（类型断言 u.(string) 位于 goroutine 之外、无 recover 保护，非 string 类型会直接 panic 被 gin.Recovery 转成 500），否则回落请求头 X-User-Id，再否则常量 \"admin\"；ORGANIZATION/PROJECT 头缺失时分别兜底 \"100001\"、\"100001100001\"。",
+      "module == ModuleSystem || module == ModuleSettingUser 时强制把 organization_id/project_id 写成 \"SYSTEM\"；sourceID == \"\" 时用 projID 顶替；method/path 取 c.Request.Method 与 c.Request.URL.Path。",
+      "落库发生在 go func(uid, oid, pid, sid, meth, pth, mod, ot, cnt string) 内，defer recover 只保护 goroutine 内部，config.DB.Create(&logRecord) 的 error 被完全忽略；OperationLog.Content 为 size:500、Path 为 size:255，超长内容在 MySQL 严格模式下整条插入失败且不留任何痕迹。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-audit-log",
+      "title": "审计操作人可被 X-User-Id 头伪造，异步写库吞掉错误与超长内容",
+      "riskLevel": "P0",
+      "riskTag": "审计伪造/数据污染",
+      "riskDescription": "审计的“操作人”可被客户端任意伪造：不带 X-AUTH-TOKEN（AuthMiddleware 放行且不设置 userId）时只要带上 X-User-Id: someone-else，operation_log.create_user 就写成 someone-else，越权/破坏性操作可嫁祸他人；完全无头时统一记成 admin，事后无法区分真实管理员与匿名调用者，越权取证链断裂。异步 goroutine 让审计写入既可能丢（DB 报错、Content 超过 500 字节被严格模式拒绝）又难以在接口返回后立即断言，形成“操作已生效但无日志”的窗口；u.(string) 的类型断言在调用方同步路径上执行，一旦上层把 userId 设为非字符串就会 panic 让整个业务请求 500。可观察症状：匿名 POST /system/organization/add 带 X-User-Id: attacker 后 SELECT create_user, content FROM operation_log ORDER BY id DESC LIMIT 1 得到 attacker | 创建组织: X。",
+      "impactScope": [
+        "service.RecordAuditLog",
+        "internal/service/audit.go:31-92",
+        "internal/middleware/auth.go:48-57",
+        "table: operation_log",
+        "SystemHandler.SystemOrgAdd",
+        "SystemHandler.GlobalPermissionUpdate",
+        "OrganizationHandler.DeleteProject"
+      ],
+      "strategy": "1) 记录 operation_log 基线行数，匿名带 X-User-Id: attacker 调用会写日志的接口（POST /system/organization/add），轮询最多 2s 等异步写入，断言 create_user 不等于 attacker（应为真实操作者或请求被拒）；2) 构造 content 超过 500 字节的调用（超长组织名），断言日志仍落库或返回明确错误而不是静默丢失；3) 带 ORGANIZATION/PROJECT 头对比，断言 organization_id/project_id 与请求上下文一致，不是无脑 100001/100001100001。",
+      "verificationChecklist": [
+        "operation_log.create_user 只能来自服务端会话，X-User-Id 头被忽略",
+        "匿名/无会话请求的审计要么被拒绝要么标记为 anonymous，不能默认为 admin",
+        "Create error 与超长 Content 不被静默吞掉（至少打点告警）",
+        "审计写入可被确定性观测（同步写或提供 flush/等待机制），module=SYSTEM 时 org/project 标记为 SYSTEM",
+        "高并发下 goroutine 写库不产生连接泄漏，且同请求的 method/path 记录正确"
+      ],
+      "cases": [
+        {
+          "id": "tc-audit-log-01",
+          "name": "test_RecordAuditLog_MustNotTrustUserIDHeader",
+          "lang": "go",
+          "filePath": "internal/service/audit_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package service_test\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\t\"time\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBAudit(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestRecordAuditLog_MustNotTrustUserIDHeader(t *testing.T) {\n\tdb := setupDBAudit(t)\n\tif err := db.Exec(\"DELETE FROM operation_log\").Error; err != nil {\n\t\tt.Fatalf(\"clean log: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodPost, \"/system/organization/add\", strings.NewReader(`{\"name\":\"AuditProbe\"}`))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\treq.Header.Set(\"X-User-Id\", \"attacker\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar n int64\n\tdeadline := time.Now().Add(2 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif err := db.Model(&model.OperationLog{}).Count(&n).Error; err != nil {\n\t\t\tt.Fatalf(\"count log: %v\", err)\n\t\t}\n\t\tif n > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\tif n == 0 {\n\t\tt.Fatalf(\"audit log not written within 2s (RecordAuditLog 在 goroutine 内写库，测试必须轮询)\")\n\t}\n\n\tvar rec model.OperationLog\n\tif err := db.Order(\"id DESC\").First(&rec).Error; err != nil {\n\t\tt.Fatalf(\"read newest log: %v\", err)\n\t}\n\tif rec.CreateUser == \"attacker\" {\n\t\tt.Fatalf(\"audit actor spoofable via unauthenticated X-User-Id header: create_user=%q content=%q\", rec.CreateUser, rec.Content)\n\t}\n\tif rec.Module != \"SYSTEM\" || rec.OrganizationID != \"SYSTEM\" || rec.ProjectID != \"SYSTEM\" {\n\t\tt.Fatalf(\"module=SYSTEM 的审计未打 SYSTEM 标记: module=%q org=%q project=%q\", rec.Module, rec.OrganizationID, rec.ProjectID)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "rec.CreateUser != \"attacker\"（当前实现为 \"attacker\"，来源为 c.GetHeader(\"X-User-Id\")）；且 rec.Module==\"SYSTEM\"、rec.OrganizationID==\"SYSTEM\"、rec.ProjectID==\"SYSTEM\"",
+            "dbStateDiff": "+1 行 operation_log(project_id='SYSTEM', organization_id='SYSTEM', create_user='admin'|真实操作者, type='ADD', module='SYSTEM', content='创建组织: AuditProbe', path='/system/organization/add')；当前实现 create_user='attacker'",
+            "traceLog": "HTTP 200 / code=200；日志写入延迟 < 20ms 但必须轮询等待（异步 goroutine）；content 超过 500 字节时该行静默缺失且无任何错误日志"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；审计写入是异步 goroutine 且错误被忽略，任何断言都必须轮询，属于最容易被漏测的基础能力",
+        "onlineMonitoring": "监控 operation_log 写入速率与业务写接口请求数之比（比值 < 1 即审计丢失）；对 create_user='admin' 的占比突增、以及出现非用户表 id 的 create_user 值告警"
+      }
+    }
+  },
+  {
+    "id": "sec-org-member",
+    "sectionNumber": "9.1",
+    "lineStart": 44,
+    "lineEnd": 176,
+    "title": "组织成员列表、可选用户与成员增删改（功能桩）",
+    "paragraphs": [
+      "GetMemberList（POST /organization/member/list，另注册在 /system/organization/member-list 与 /system/organization/list-member）接收 OrganizationID 但从未用于查询：query := config.DB.Model(&model.User{}).Where(\"deleted = 0\") 是全表分页；每行 ProjectIdNameMap 填入的是全部 deleted = 0 的项目，UserRoleIdNameMap 硬编码 [{org_admin,组织管理员}]。",
+      "GetUserRoleOptions 与 GetProjectOptions 都从 c.Param(\"organizationId\") 取组织；GetAvailableUsers（路由 /organization/not-exist/user/list/:organizationId）忽略组织参数，返回全库用户并拼成 ID=u.ID、Name=u.Name + \" (\" + u.Email + \")\"。",
+      "AddMember、UpdateMember、RemoveMember、InviteMember、BatchAddProject 五个方法体都只有 response.Success(c, \"ok\")，不解析请求体、不写 user/user_role_relation/project 表。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-org-member",
+      "title": "组织成员列表不受 organizationId 约束，成员增删改全是空实现",
+      "riskLevel": "P0",
+      "riskTag": "越权/功能桩(契约破坏)",
+      "riskDescription": "组织成员页会把全库用户当成该组织成员展示（跨组织数据泄露），并且每个成员旁都挂上全部项目，前端“所属项目”列在多组织场景下必然错乱，用户无法区分真实归属；成员增删改全是空实现——点“添加成员”返回 200 但库里没有任何变化，刷新后列表恢复原样，测试人员会误判为筛选/缓存/权限问题而反复排查。可观察症状：POST /organization/member/list {\"organizationId\":\"o1\"} 返回的 list 含 lastOrganizationId=o2 的用户，projectIdNameMap 含 o2 的项目；POST /organization/add-member {\"organizationId\":\"o1\",\"userIds\":[\"u9\"],\"userRoleId\":\"org_member\"} 后 SELECT count(*) FROM user_role_relation WHERE user_id='u9' 仍为 0。",
+      "impactScope": [
+        "OrganizationHandler.GetMemberList",
+        "OrganizationHandler.GetAvailableUsers",
+        "OrganizationHandler.AddMember",
+        "OrganizationHandler.UpdateMember",
+        "OrganizationHandler.RemoveMember",
+        "OrganizationHandler.InviteMember",
+        "OrganizationHandler.BatchAddProject",
+        "internal/handler/organization.go:44-176",
+        "internal/router/router.go:170-173",
+        "internal/router/router.go:234-242",
+        "table: user",
+        "table: project",
+        "table: user_role_relation"
+      ],
+      "strategy": "1) 造 o1/o2 两个组织、分属两组织的用户与项目，POST /organization/member/list {\"organizationId\":\"o1\"}，断言 list 中不出现 o2 用户、projectIdNameMap 不含 o2 项目；2) POST /organization/add-member {\"organizationId\":\"o1\",\"userIds\":[\"u9\"],\"userRoleId\":\"org_member\"}，断言 user_role_relation 新增 (u9, org_member)；3) POST /organization/remove-member 后断言关系行被删除。",
+      "verificationChecklist": [
+        "member/list 的返回严格受 organizationId 约束（用户与 projectIdNameMap 都不跨组织）",
+        "UserRoleIdNameMap 来自该组织的角色表，不使用硬编码 org_admin",
+        "add-member 写入 user_role_relation 且重复提交不产生重复行",
+        "update-member 能修改成员角色，remove-member 能删除关系（数据与返回一致）",
+        "batch-add-project 落库 project 或明确返回不支持，不返回假成功"
+      ],
+      "cases": [
+        {
+          "id": "tc-org-member-01",
+          "name": "test_OrgMemberList_MustBeScopedToOrganization",
+          "lang": "go",
+          "filePath": "internal/handler/organization_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBOrgMember(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestOrgMemberList_MustBeScopedToOrganization(t *testing.T) {\n\tdb := setupDBOrgMember(t)\n\tif err := db.Exec(\"DELETE FROM `user`\").Error; err != nil {\n\t\tt.Fatalf(\"clean user: %v\", err)\n\t}\n\tif err := db.Exec(\"DELETE FROM project\").Error; err != nil {\n\t\tt.Fatalf(\"clean project: %v\", err)\n\t}\n\tif err := db.Create(&model.Organization{ID: \"o1\", Name: \"O1\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed o1: %v\", err)\n\t}\n\tif err := db.Create(&model.Project{ID: \"p2\", OrganizationID: \"o2\", Name: \"P2\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed p2: %v\", err)\n\t}\n\tif err := db.Create(&model.User{ID: \"u2\", Name: \"Outsider\", Email: \"u2@o2.io\", Enable: model.BitBool(true), Deleted: model.BitBool(false), LastOrganizationID: \"o2\", LastProjectID: \"p2\"}).Error; err != nil {\n\t\tt.Fatalf(\"seed u2: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodPost, \"/organization/member/list\", strings.NewReader(`{\"organizationId\":\"o1\",\"current\":1,\"pageSize\":10}`))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar got struct {\n\t\tCode int `json:\"code\"`\n\t\tData struct {\n\t\t\tList []struct {\n\t\t\t\tID                 string `json:\"id\"`\n\t\t\t\tLastOrganizationID string `json:\"lastOrganizationId\"`\n\t\t\t\tProjectIdNameMap   []struct {\n\t\t\t\t\tID string `json:\"id\"`\n\t\t\t\t} `json:\"projectIdNameMap\"`\n\t\t\t} `json:\"list\"`\n\t\t\tTotal int64 `json:\"total\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {\n\t\tt.Fatalf(\"unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tfor _, m := range got.Data.List {\n\t\tif m.LastOrganizationID != \"o1\" {\n\t\t\tt.Fatalf(\"o1 member list leaked user %q whose organization is %q (OrganizationID param ignored, total=%d)\", m.ID, m.LastOrganizationID, got.Data.Total)\n\t\t}\n\t\tfor _, p := range m.ProjectIdNameMap {\n\t\t\tif p.ID == \"p2\" {\n\t\t\t\tt.Fatalf(\"member %q carries project p2 which belongs to organization o2\", m.ID)\n\t\t\t}\n\t\t}\n\t}\n}\n",
+          "evidence": {
+            "assertion": "list 中不存在 LastOrganizationID != \"o1\" 的成员，且任何成员的 projectIdNameMap 不含 p2；当前实现返回 u2 且每个成员都带 p2",
+            "dbStateDiff": "[READ-ONLY] no write expected（夹具：1 行 organization + 1 行 project + 1 行 user）",
+            "traceLog": "HTTP 200 / code=200 / data.total 等于 user 表行数"
+          }
+        },
+        {
+          "id": "tc-org-member-02",
+          "name": "test_OrgAddMember_MustCreateRelation",
+          "lang": "go",
+          "filePath": "internal/handler/organization_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBOrgAddMember(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestOrgAddMember_MustCreateRelation(t *testing.T) {\n\tdb := setupDBOrgAddMember(t)\n\tif err := db.Exec(\"DELETE FROM user_role_relation\").Error; err != nil {\n\t\tt.Fatalf(\"clean relation: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodPost, \"/organization/add-member\", strings.NewReader(`{\"organizationId\":\"o1\",\"userIds\":[\"u9\"],\"userRoleId\":\"org_member\"}`))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\treq.Header.Set(\"X-AUTH-TOKEN\", \"stub-session\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar n int64\n\tif err := db.Model(&model.UserRoleRelation{}).Where(\"user_id = ? AND role_id = ?\", \"u9\", \"org_member\").Count(&n).Error; err != nil {\n\t\tt.Fatalf(\"count relation: %v\", err)\n\t}\n\tif n != 1 {\n\t\tt.Fatalf(\"add-member returned http=%d body=%s but inserted %d user_role_relation row(s) (功能桩)\", w.Code, w.Body.String(), n)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "SELECT count(*) FROM user_role_relation WHERE user_id='u9' AND role_id='org_member' == 1；当前实现为 0（AddMember 只有 response.Success(c, \"ok\")）",
+            "dbStateDiff": "+1 行 user_role_relation(user_id='u9', role_id='org_member', source_id='o1')；当前实现无写入",
+            "traceLog": "HTTP 200 / data=\"ok\" 与 0 行增量矛盾；operation_log 无新增记录"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；成员管理是本模块最核心的写路径却全是桩，必须先建契约用例才能判定前端联调失败原因",
+        "onlineMonitoring": "监控 member/list 返回条数与 user 表行数的比值（长期等于 1 说明未按组织过滤）；对 add/update/remove-member 接口 200 响应数与 user_role_relation 行数增量长期不一致告警"
+      }
+    }
+  },
+  {
+    "id": "sec-org-project",
+    "sectionNumber": "9.2",
+    "lineStart": 201,
+    "lineEnd": 342,
+    "title": "组织内项目分页、创建与启停",
+    "paragraphs": [
+      "GetProjectPage（POST /organization/project/page）用 ShouldBindJSON 取 organizationId 做可选 organization_id 过滤 + deleted = 0，逐行填 MemberCount: 1 与 OrgAdmins: defaultAdmins。",
+      "AddProject（POST /organization/project/add）直接把 body.OrganizationID 写库（无兜底、无组织存在性/启用校验），ID 同样取 fmt.Sprintf(\"%d\", time.Now().UnixMilli()) 且 Create 错误不检查；UpdateProject/RenameProject 无条件覆盖 name/description/name，且 Where(\"id = ?\", body.ID) 无 deleted = 0。",
+      "DeleteProject（GET /organization/project/delete/:id）记 RecordAuditLog(c, ModuleOrgProject, OpTypeDelete, id, \"删除项目: \"+id)，而 EnableProject（GET /organization/project/enable/:id）与 DisableProject（GET /organization/project/disable/:id）只改 enable 字段，既不写审计日志，也不校验 deleted。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-org-project",
+      "title": "项目启停不留审计日志，AddProject 允许空 organizationId 产生悬空项目",
+      "riskLevel": "P1",
+      "riskTag": "审计缺失/数据污染",
+      "riskDescription": "同一个组织内项目启停不留任何 operation_log，配合 RecordAuditLog 的兜底（无会话时 create_user 恒为 admin）会导致“谁禁用了项目”完全无法追溯；AddProject 允许 organizationId 为空串，产生 organization_id='' 的悬空项目，GetProjectPage 按组织过滤时永远查不到它，而系统级项目列表会把它计入 total，出现“总数与列表不一致”的诡异现象；Update/Rename 还能改到软删除项目。可观察症状：GET /organization/project/disable/p1 之后 SELECT count(*) FROM operation_log WHERE module='ORGANIZATION_PROJECT' AND content LIKE '禁用项目%' = 0，但 project.enable 已变 0；POST /organization/project/add {\"name\":\"X\"} 后出现 organization_id='' 的行。",
+      "impactScope": [
+        "OrganizationHandler.GetProjectPage",
+        "OrganizationHandler.AddProject",
+        "OrganizationHandler.UpdateProject",
+        "OrganizationHandler.RenameProject",
+        "OrganizationHandler.DeleteProject",
+        "OrganizationHandler.EnableProject",
+        "OrganizationHandler.DisableProject",
+        "internal/handler/organization.go:201-342",
+        "internal/router/router.go:245-251",
+        "table: project",
+        "table: operation_log"
+      ],
+      "strategy": "1) 造 o1/p1，GET /organization/project/disable/p1，断言 project.enable=0 且 operation_log 新增 module='ORGANIZATION_PROJECT'、type='UPDATE'、source_id='p1' 的记录（当前 0 条）；2) POST /organization/project/add {\"name\":\"X\"}（不带 organizationId）断言被拒或兜底到有效组织，不允许写入空 organization_id；3) 造 deleted=1 的项目，断言 enable/disable/update 对其不生效。",
+      "verificationChecklist": [
+        "disable/enable 项目必须写 operation_log 且 create_user 为真实操作者",
+        "AddProject 必须校验 organizationId 非空且组织存在、未删除、未禁用",
+        "update/rename 对 deleted=1 的项目不生效或返回 404",
+        "GetProjectPage 的 memberCount/orgAdmins 来自真实关系而不是常量",
+        "同一毫秒两次 AddProject 的 id 唯一，Create 失败不得返回 200"
+      ],
+      "cases": [
+        {
+          "id": "tc-org-project-01",
+          "name": "test_OrgProjectDisable_MustWriteAuditLog",
+          "lang": "go",
+          "filePath": "internal/handler/organization_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"testing\"\n\t\"time\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBOrgProject(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestOrgProjectDisable_MustWriteAuditLog(t *testing.T) {\n\tdb := setupDBOrgProject(t)\n\tif err := db.Exec(\"DELETE FROM project\").Error; err != nil {\n\t\tt.Fatalf(\"clean project: %v\", err)\n\t}\n\tif err := db.Exec(\"DELETE FROM operation_log\").Error; err != nil {\n\t\tt.Fatalf(\"clean log: %v\", err)\n\t}\n\tif err := db.Create(&model.Project{ID: \"p1\", OrganizationID: \"o1\", Name: \"P1\", Enable: model.BitBool(true), Deleted: model.BitBool(false)}).Error; err != nil {\n\t\tt.Fatalf(\"seed p1: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodGet, \"/organization/project/disable/p1\", nil)\n\treq.Header.Set(\"X-AUTH-TOKEN\", \"stub-session\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar p model.Project\n\tif err := db.Where(\"id = ?\", \"p1\").First(&p).Error; err != nil {\n\t\tt.Fatalf(\"reload p1: %v\", err)\n\t}\n\tif bool(p.Enable) {\n\t\tt.Fatalf(\"disable did not take effect: enable=%v body=%s\", p.Enable, w.Body.String())\n\t}\n\n\tvar logs int64\n\tdeadline := time.Now().Add(2 * time.Second)\n\tfor time.Now().Before(deadline) {\n\t\tif err := db.Model(&model.OperationLog{}).Where(\"module = ? AND source_id = ?\", \"ORGANIZATION_PROJECT\", \"p1\").Count(&logs).Error; err != nil {\n\t\t\tt.Fatalf(\"count log: %v\", err)\n\t\t}\n\t\tif logs > 0 {\n\t\t\tbreak\n\t\t}\n\t\ttime.Sleep(20 * time.Millisecond)\n\t}\n\tif logs == 0 {\n\t\tt.Fatalf(\"disable writes no audit log: EnableProject/DisableProject 缺少 RecordAuditLog (http=%d body=%s)\", w.Code, w.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "project.enable == 0 且 SELECT count(*) FROM operation_log WHERE module='ORGANIZATION_PROJECT' AND source_id='p1' >= 1；当前实现 enable=0 但日志为 0 条",
+            "dbStateDiff": "UPDATE project SET enable=0, updated_at=? WHERE id='p1' 且 +1 行 operation_log(module='ORGANIZATION_PROJECT', type='UPDATE', source_id='p1', content='禁用项目: p1')；当前实现只有前半段",
+            "traceLog": "HTTP 200 / data=\"ok\"；轮询 2s 内日志数恒为 0（对比 DeleteProject 会写日志）"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；项目启停缺审计是写路径覆盖空洞，且与删除路径行为不一致",
+        "onlineMonitoring": "对 project.enable 变更次数与 operation_log(module=ORGANIZATION_PROJECT) 增量做差值告警；巡检 organization_id='' 的 project 悬空行"
+      }
+    }
+  },
+  {
+    "id": "sec-org-role-service",
+    "sectionNumber": "9.3",
+    "lineStart": 346,
+    "lineEnd": 517,
+    "title": "组织角色/用户组/权限配置与服务集成",
+    "paragraphs": [
+      "GetOrgUserRoleList（GET /user/role/organization/list/:organizationId）与 GetUserRoleOptions（GET /organization/user/role/list/:organizationId）都用 Where(\"type = 'ORGANIZATION' OR scope_id = ?\", orgID)：bootstrap 把 org_admin/org_member 的 scope_id 写成 'global'，因此该查询把所有组织类型角色全量返回；GetOrgUserRoleList 在结果为空时会在内存里凭空造 org_admin/org_member（ScopeID: orgID）作为响应但不落库，而 GetUserRoleOptions 返回的是 []map[string]interface{} 形态（与前者返回 model.UserRole 全字段形态不一致）。",
+      "OrgUserGroupMemberList（POST /user/role/organization/list-member）只按 role_id 过滤，body.OrganizationID 完全未参与查询，Where(\"id IN ?\", userIDs).Find(&users) 缺 deleted = 0；成员项字段是 id/userId/userName/userEmail，与全局变体 GlobalUserGroupMemberList 的 id/userId/name/email 命名不一致；当 role_id 为 org_admin 或 admin 且查不到数据时，硬塞一条 {ID:\"rel-admin\",UserID:\"admin\",UserName:\"Administrator\",UserEmail:\"admin@metersphere.io\",CreatedAt:1700000000000} 并把 total 改成 1。",
+      "OrgPermissionSetting（GET /user/role/organization/permission/setting/:roleId）完全忽略 :roleId，返回硬编码的 ORG_PROJECT/ORG_MEMBER 两级权限树且每个 checked 恒为 true；OrgPermissionUpdate（POST /user/role/organization/permission/update）只有 response.Success(c, \"ok\")，读的是常量、写的是空气。",
+      "服务集成 ServiceIntegrationList/Add/Update/Delete/Validate/Script 全部只返回 []interface{}{} 或字符串 \"ok\"，不解析参数、不落库；其中列表接口的 data 直接是数组，与其它列表接口的 {list,total} 形态不同。"
+    ],
+    "diffStatus": "GAP",
+    "analysis": {
+      "id": "ana-org-role-service",
+      "title": "伪造 rel-admin 假成员与空库角色、组织权限读写全为常量、服务集成全桩",
+      "riskLevel": "P1",
+      "riskTag": "契约破坏/数据污染/功能桩",
+      "riskDescription": "组织角色列表跨组织泄露（type='ORGANIZATION' 会把 o2 的组织角色也返回），且响应体在“库里有角色”和“库里没角色”两种情况下是不同形态（model.UserRole 全字段 vs 内存伪角色），前端在空库时看到的是根本不存在的 org_admin（internal:true、scopeId=当前组织），点进去保存权限又是 no-op；OrgUserGroupMemberList 会吐出不存在的 rel-admin 假成员，前端按该 id 删除或改角色时命中不到任何行却仍返回成功，形成“删不掉的幽灵成员”；成员字段命名 userName/userEmail 与全局变体 name/email 不一致，复用同一前端组件的页面会渲染空白。服务集成整块是桩：新增集成后列表仍为空数组。可观察症状：POST /user/role/organization/list-member {\"userRoleId\":\"org_admin\",\"organizationId\":\"o2\"} 在无数据时返回 list:[{id:\"rel-admin\",userId:\"admin\",userName:\"Administrator\"}]、total:1，而 SELECT count(*) FROM user_role_relation WHERE role_id='org_admin' = 0。",
+      "impactScope": [
+        "OrganizationHandler.GetUserRoleOptions",
+        "OrganizationHandler.GetOrgUserRoleList",
+        "OrganizationHandler.OrgUserGroupMemberList",
+        "OrganizationHandler.OrgUserGroupMemberOption",
+        "OrganizationHandler.OrgUserGroupAddMember",
+        "OrganizationHandler.OrgUserGroupDeleteMember",
+        "OrganizationHandler.OrgPermissionSetting",
+        "OrganizationHandler.OrgPermissionUpdate",
+        "OrganizationHandler.ServiceIntegrationList",
+        "OrganizationHandler.ServiceIntegrationAdd",
+        "internal/handler/organization.go:103-124",
+        "internal/handler/organization.go:346-517",
+        "internal/router/router.go:254-272",
+        "table: user_role",
+        "table: user_role_relation",
+        "table: user_role_permission"
+      ],
+      "strategy": "1) 清空 user_role_relation 后 POST /user/role/organization/list-member {\"userRoleId\":\"org_admin\",\"organizationId\":\"o2\"}，断言 list 与 total 均为空（当前返回伪造的 rel-admin 且 total=1）；2) 造 o1/o2 各自的 ORGANIZATION 角色，断言 /user/role/organization/list/o1 只返回 o1 作用域角色；3) 对服务集成先 add 再 list，断言 list 能查到新增项（当前恒为空数组）；4) 断言组织权限树与 :roleId 相关（不同角色返回不同 checked），保存后再读取能回读。",
+      "verificationChecklist": [
+        "list-member 不返回任何库中不存在的成员行，total 与真实关系数一致",
+        "组织成员列表按 organizationId 与 scope/role 归属过滤，不跨组织返回",
+        "组织角色列表只返回该组织作用域的角色；空结果时为 [] 而非内存伪角色",
+        "组织权限 setting/update 与 :roleId 关联，保存后可回读（写路径真实落库 user_role_permission）",
+        "服务集成 add 后 list 能查到该项，且列表形态与前端契约一致（数组或 {list,total} 二选一并固定）"
+      ],
+      "cases": [
+        {
+          "id": "tc-org-role-service-01",
+          "name": "test_OrgUserGroupMemberList_MustNotFabricateRows",
+          "lang": "go",
+          "filePath": "internal/handler/organization_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBOrgGroup(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestOrgUserGroupMemberList_MustNotFabricateRows(t *testing.T) {\n\tdb := setupDBOrgGroup(t)\n\tif err := db.Exec(\"DELETE FROM user_role_relation\").Error; err != nil {\n\t\tt.Fatalf(\"clean relation: %v\", err)\n\t}\n\n\tr := router.SetupRouter()\n\treq := httptest.NewRequest(http.MethodPost, \"/user/role/organization/list-member\", strings.NewReader(`{\"userRoleId\":\"org_admin\",\"organizationId\":\"o2\",\"current\":1,\"pageSize\":10}`))\n\treq.Header.Set(\"Content-Type\", \"application/json\")\n\tw := httptest.NewRecorder()\n\tr.ServeHTTP(w, req)\n\n\tvar got struct {\n\t\tCode int `json:\"code\"`\n\t\tData struct {\n\t\t\tList []struct {\n\t\t\t\tID       string `json:\"id\"`\n\t\t\t\tUserID   string `json:\"userId\"`\n\t\t\t\tUserName string `json:\"userName\"`\n\t\t\t\tName     string `json:\"name\"`\n\t\t\t} `json:\"list\"`\n\t\t\tTotal int64 `json:\"total\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {\n\t\tt.Fatalf(\"unmarshal: %v body=%s\", err, w.Body.String())\n\t}\n\tif len(got.Data.List) != 0 || got.Data.Total != 0 {\n\t\tt.Fatalf(\"empty role returned fabricated rows: total=%d list=%+v (硬编码 rel-admin 假成员)\", got.Data.Total, got.Data.List)\n\t}\n}\n",
+          "evidence": {
+            "assertion": "data.list 长度 == 0 且 data.total == 0；当前实现为 list=[{id:\"rel-admin\",userId:\"admin\",userName:\"Administrator\"}]、total=1（库中无该行）",
+            "dbStateDiff": "[READ-ONLY] no write expected（user_role_relation 保持 0 行）",
+            "traceLog": "HTTP 200 / code=200；响应体字段名为 userName/userEmail，与全局变体 name/email 不一致"
+          }
+        },
+        {
+          "id": "tc-org-role-service-02",
+          "name": "test_ServiceIntegrationAdd_ThenListMustContainIt",
+          "lang": "go",
+          "filePath": "internal/handler/organization_test.go",
+          "lineNo": 1,
+          "status": "MISSING",
+          "codeSnippet": "package handler_test\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"testing\"\n\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n\t\"trueone-anubis/config\"\n\t\"trueone-anubis/internal/model\"\n\t\"trueone-anubis/internal/router\"\n)\n\nfunc setupDBServiceIntegration(t *testing.T) *gorm.DB {\n\tt.Helper()\n\tgin.SetMode(gin.TestMode)\n\tif _, err := config.LoadConfig(\"../../config/config.yaml\"); err != nil {\n\t\tt.Skipf(\"no config: %v\", err)\n\t}\n\tdb, err := config.InitDB()\n\tif err != nil {\n\t\tt.Skipf(\"no mysql: %v\", err)\n\t}\n\tif err := db.AutoMigrate(&model.User{}, &model.UserRole{}, &model.UserRoleRelation{}, &model.UserRolePermission{}, &model.Organization{}, &model.Project{}, &model.OperationLog{}); err != nil {\n\t\tt.Fatalf(\"migrate: %v\", err)\n\t}\n\treturn db\n}\n\nfunc TestServiceIntegrationAdd_ThenListMustContainIt(t *testing.T) {\n\tsetupDBServiceIntegration(t)\n\tr := router.SetupRouter()\n\n\tadd := httptest.NewRequest(http.MethodPost, \"/service/integration/add\", strings.NewReader(`{\"organizationId\":\"o1\",\"name\":\"Jira\",\"type\":\"JIRA\",\"enable\":true}`))\n\tadd.Header.Set(\"Content-Type\", \"application/json\")\n\taddW := httptest.NewRecorder()\n\tr.ServeHTTP(addW, add)\n\n\tlist := httptest.NewRequest(http.MethodGet, \"/service/integration/list/o1\", nil)\n\tlistW := httptest.NewRecorder()\n\tr.ServeHTTP(listW, list)\n\n\tvar got struct {\n\t\tCode int `json:\"code\"`\n\t\tData []struct {\n\t\t\tName string `json:\"name\"`\n\t\t} `json:\"data\"`\n\t}\n\tif err := json.Unmarshal(listW.Body.Bytes(), &got); err != nil {\n\t\tt.Fatalf(\"unmarshal: %v body=%s\", err, listW.Body.String())\n\t}\n\tfound := false\n\tfor _, item := range got.Data {\n\t\tif item.Name == \"Jira\" {\n\t\t\tfound = true\n\t\t}\n\t}\n\tif !found {\n\t\tt.Fatalf(\"integration add returned %s but list=%s does not contain it (纯桩，忽略入参)\", addW.Body.String(), listW.Body.String())\n\t}\n}\n",
+          "evidence": {
+            "assertion": "list 的 data 中存在 name == \"Jira\" 的项；当前实现 add 返回 200/data=\"ok\"，list 恒为 []",
+            "dbStateDiff": "+1 行 service_integration(organization_id='o1', name='Jira', type='JIRA', enable=1)；当前实现无任何持久化写入",
+            "traceLog": "add: HTTP 200 / data=\"ok\"；list: HTTP 200 / data=[]（形态为裸数组，其它列表接口为 {list,total}）"
+          }
+        }
+      ],
+      "uncoveredNotice": {
+        "reason": "无测试文件；伪造默认行、权限读写常量、服务集成全桩三类问题混在同一组接口里，需要逐条落基线用例",
+        "onlineMonitoring": "巡检 user_role_relation 中 role_id='org_admin' 为空时接口仍返回 total>0 的请求（前端埋点“幽灵成员”删除失败率）；监控 service/integration/list 长期恒为空数组但 add 有成功响应"
+      }
+    }
+  }
+]
