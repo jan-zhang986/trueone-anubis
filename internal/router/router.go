@@ -25,6 +25,7 @@ func SetupRouter() *gin.Engine {
 	orgH := handler.NewOrganizationHandler()
 	logH := handler.NewLogHandler()
 	menuH := handler.NewMenuHandler()
+	wfH := handler.NewWorkflowHandler()
 
 	// Helper to register routes on both root and /api prefixes
 	register := func(rg *gin.RouterGroup) {
@@ -81,6 +82,9 @@ func SetupRouter() *gin.Engine {
 		rg.POST("/quality-workspace/report/page", wsH.GetReportPage)
 		rg.GET("/quality-workspace/report/:reportId", wsH.GetReportDetail)
 		rg.POST("/quality-workspace/:id/report/generate", wsH.GenerateReport)
+
+		// Workflow DAG Engine
+		rg.POST("/workflow/execute", wfH.ExecuteGraph)
 
 		// Living Test Plan Diff Matrix (Code-as-Spec & Sync)
 		rg.GET("/quality-workspace/:id/diff-matrix", wsH.GetDiffMatrix)
