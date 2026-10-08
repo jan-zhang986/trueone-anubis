@@ -66,6 +66,7 @@ func SetupRouter() *gin.Engine {
 		rg.GET("/case/repository/:id/branches", repoCaseH.GetRepositoryBranches)
 		rg.POST("/case/repository/:id/branches", repoCaseH.CreateRepositoryBranch)
 		rg.POST("/case/repository/:id/sync", repoCaseH.SyncRepository)
+		rg.POST("/case/repository/:id/execute-case", repoCaseH.ExecuteCase)
 
 		// Environment
 		rg.POST("/project/environment/list", projH.GetEnvironmentList)
