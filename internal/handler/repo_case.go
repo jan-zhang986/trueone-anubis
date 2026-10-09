@@ -1438,4 +1438,232 @@ func (h *RepoCaseHandler) CommitCode(c *gin.Context) {
 	})
 }
 
+// CreateCaseRequest 云端新建用例请求参数
+type CreateCaseRequest struct {
+	Branch      string `json:"branch"`
+	FilePath    string `json:"filePath"` // 相对路径，如 workflows/order_settle.workflow.yaml
+	Title       string `json:"title" binding:"required"`
+	Module      string `json:"module"`
+	Priority    string `json:"priority"` // P0, P1, P2
+	Type        string `json:"type"`     // "yaml" 或 "code"
+	CodeContent string `json:"codeContent"`
+}
+
+// CreateCase 云端新建用例 (支持自动生成规范黄金 YAML 模版，并落盘/提交 Git)
+func (h *RepoCaseHandler) CreateCase(c *gin.Context) {
+	id := c.Param("id")
+	var req CreateCaseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, 400, "参数错误: "+err.Error())
+		return
+	}
+
+	var repo model.CaseRepository
+	if err := config.DB.Where("id = ?", id).First(&repo).Error; err != nil {
+		response.Fail(c, 404, "用例库不存在")
+		return
+	}
+
+	branch := req.Branch
+	if branch == "" {
+		branch = repo.DefaultBranch
+		if branch == "" {
+			branch = "main"
+		}
+	}
+
+	// 路径规范化处理
+	rawPath := strings.TrimSpace(req.FilePath)
+	if rawPath == "" {
+		// 根据标题自动推导文件名
+		cleanName := strings.ToLower(strings.ReplaceAll(req.Title, " ", "_"))
+		rawPath = fmt.Sprintf("workflows/%s.workflow.yaml", cleanName)
+	}
+	if !strings.HasSuffix(rawPath, ".yaml") && !strings.HasSuffix(rawPath, ".yml") && !strings.HasSuffix(rawPath, ".go") && !strings.HasSuffix(rawPath, ".py") {
+		rawPath += ".workflow.yaml"
+	}
+	if !strings.HasPrefix(rawPath, "workflows/") && !strings.HasPrefix(rawPath, "tests/") {
+		rawPath = "workflows/" + rawPath
+	}
+
+	// 相对测试目录的路径
+	fullRelativePath := rawPath
+	if repo.TestsDir != "" && !strings.HasPrefix(rawPath, repo.TestsDir) {
+		fullRelativePath = filepath.Join(repo.TestsDir, rawPath)
+	}
+
+	moduleName := req.Module
+	if moduleName == "" {
+		moduleName = "业务交易引擎"
+	}
+	priority := req.Priority
+	if priority == "" {
+		priority = "P1"
+	}
+
+	// 如果没有传入内容，基于黄金 DAG 规约自动生成初始模版
+	content := req.CodeContent
+	if strings.TrimSpace(content) == "" {
+		caseSlug := strings.ToLower(strings.ReplaceAll(strings.TrimSuffix(filepath.Base(rawPath), ".workflow.yaml"), "-", "_"))
+		content = fmt.Sprintf(`id: %s
+name: "%s"
+module: "%s"
+priority: "%s"
+description: "通过网关调用、数据库核验与安全门禁，确保全链路数据一致性"
+
+variables:
+  userId: "usr_auto_9527"
+  bizOrderId: "ord_100293"
+  expectedAmount: 99.00
+
+nodes:
+  # 步骤 1: 触发业务接口请求 (HTTP)
+  - id: step_trigger_api
+    name: "调用网关业务接口"
+    type: HTTP
+    dependsOn: []
+    config:
+      url: "/api/v1/orders"
+      method: "POST"
+      body:
+        userId: "{{ variables.userId }}"
+        amount: "{{ variables.expectedAmount }}"
+      extract:
+        orderId: "data.order_id"
+        bizStatus: "data.status"
+      assertions:
+        - field: "status_code"
+          operator: "equals"
+          expected: 200
+
+  # 步骤 2: 数据库状态核销与借贷核对 (SQL - 依赖 step_trigger_api)
+  - id: step_verify_database
+    name: "校验数据库记账流水与状态"
+    type: SQL
+    dependsOn: ["step_trigger_api"]
+    config:
+      datasource: "default_trade_db"
+      sql: >-
+        SELECT status, amount 
+        FROM t_trade_ledger 
+        WHERE user_id = '{{ variables.userId }}' 
+        LIMIT 1;
+      extract:
+        flowStatus: "status"
+      assertions:
+        - field: "status"
+          operator: "equals"
+          expected: "SETTLED"
+        - field: "amount"
+          operator: "equals"
+          expected: "{{ variables.expectedAmount }}"
+
+  # 步骤 3: 资金与业务安全准入门禁 (QUALITY_GATE - 依赖 step_verify_database)
+  - id: step_quality_gate
+    name: "准出安全防线门禁"
+    type: QUALITY_GATE
+    dependsOn: ["step_verify_database"]
+    config:
+      rule: "FINANCIAL_CONSISTENCY"
+      condition: "{{ step_verify_database.output.flowStatus }} == 'SETTLED'"
+`, caseSlug, req.Title, moduleName, priority)
+	}
+
+	// 1. 尝试本地文件写入
+	localBase := repo.LocalPath
+	if localBase == "" {
+		for _, probe := range []string{
+			"/Users/zhangjian/vanguard-platform/trueone-anubis",
+			".",
+		} {
+			if fi, err := os.Stat(probe); err == nil && fi.IsDir() {
+				localBase = probe
+				break
+			}
+		}
+	}
+
+	var commitSha string
+	gitToken := repo.GitToken
+	if gitToken == "" {
+		gitToken = os.Getenv("GITHUB_TOKEN")
+	}
+
+	// 优先 GitHub API 模式
+	if gitToken != "" && strings.Contains(repo.GitURL, "github.com") {
+		sha, err := commitViaGitHubAPI(
+			repo.GitURL,
+			gitToken,
+			branch,
+			fullRelativePath,
+			content,
+			fmt.Sprintf("test: create new case %s via TrueOne Web", req.Title),
+			"TrueOne Online Editor",
+			"noreply@trueone.platform",
+		)
+		if err == nil {
+			commitSha = sha
+		}
+	}
+
+	// 本地写入并 git 提交兜底
+	if localBase != "" {
+		absPath := filepath.Join(localBase, fullRelativePath)
+		_ = os.MkdirAll(filepath.Dir(absPath), 0755)
+		if err := os.WriteFile(absPath, []byte(content), 0644); err != nil {
+			response.Fail(c, 500, "本地文件创建失败: "+err.Error())
+			return
+		}
+
+		_ = exec.Command("git", "-C", localBase, "add", fullRelativePath).Run()
+		_ = exec.Command("git", "-C", localBase, "commit", "-m", fmt.Sprintf("test: create new case %s", req.Title)).Run()
+		if shaOut, err := exec.Command("git", "-C", localBase, "rev-parse", "HEAD").Output(); err == nil && commitSha == "" {
+			commitSha = strings.TrimSpace(string(shaOut))
+		}
+	}
+
+	// 刷新用例库列表
+	cases, _ := getRepoCasesDynamic(repo.ID, branch)
+	config.DB.Model(&model.CaseRepository{}).Where("id = ?", repo.ID).Update("case_count", len(cases))
+
+	// 找到刚刚创建的新用例对象
+	var createdCase *UnifiedTestCaseItem
+	for i := range cases {
+		if cases[i].GitFilePath == fullRelativePath || strings.HasSuffix(cases[i].GitFilePath, rawPath) {
+			createdCase = &cases[i]
+			break
+		}
+	}
+
+	// 如果扫描还没扫出，构造一个即时对象
+	if createdCase == nil {
+		createdCase = &UnifiedTestCaseItem{
+			ID:             fmt.Sprintf("TC-%d", time.Now().UnixMilli()%100000),
+			Code:           fmt.Sprintf("TC-%d", time.Now().UnixMilli()%100000),
+			Title:          req.Title,
+			Priority:       priority,
+			Status:         "ready",
+			Module:         moduleName,
+			ReqSource:      "ONLINE-CREATE",
+			GitRepo:        repo.GitURL,
+			GitBranch:      branch,
+			GitFilePath:    fullRelativePath,
+			FunctionName:   req.Title,
+			ScriptLanguage: "yaml",
+			CodeContent:    content,
+			LastCommitHash: commitSha,
+			LastCommitTime: time.Now().Format("2006-01-02 15:04"),
+			Author:         "TrueOne Online Editor",
+		}
+	}
+
+	response.Success(c, gin.H{
+		"message":   "用例创建成功",
+		"case":      createdCase,
+		"filePath":  fullRelativePath,
+		"commitSha": commitSha,
+	})
+}
+
+
 
