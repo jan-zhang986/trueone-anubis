@@ -1,0 +1,61 @@
+id: cloud_test_order
+name: "云端测试创建-订单对账闭环核对"
+module: "资金中台"
+priority: "P0"
+description: "通过网关调用、数据库核验与安全门禁，确保全链路数据一致性"
+
+variables:
+  userId: "usr_auto_9527"
+  bizOrderId: "ord_100293"
+  expectedAmount: 99.00
+
+nodes:
+  # 步骤 1: 触发业务接口请求 (HTTP)
+  - id: step_trigger_api
+    name: "调用网关业务接口"
+    type: HTTP
+    dependsOn: []
+    config:
+      url: "/api/v1/orders"
+      method: "POST"
+      body:
+        userId: "{{ variables.userId }}"
+        amount: "{{ variables.expectedAmount }}"
+      extract:
+        orderId: "data.order_id"
+        bizStatus: "data.status"
+      assertions:
+        - field: "status_code"
+          operator: "equals"
+          expected: 200
+
+  # 步骤 2: 数据库状态核销与借贷核对 (SQL - 依赖 step_trigger_api)
+  - id: step_verify_database
+    name: "校验数据库记账流水与状态"
+    type: SQL
+    dependsOn: ["step_trigger_api"]
+    config:
+      datasource: "default_trade_db"
+      sql: >-
+        SELECT status, amount 
+        FROM t_trade_ledger 
+        WHERE user_id = '{{ variables.userId }}' 
+        LIMIT 1;
+      extract:
+        flowStatus: "status"
+      assertions:
+        - field: "status"
+          operator: "equals"
+          expected: "SETTLED"
+        - field: "amount"
+          operator: "equals"
+          expected: "{{ variables.expectedAmount }}"
+
+  # 步骤 3: 资金与业务安全准入门禁 (QUALITY_GATE - 依赖 step_verify_database)
+  - id: step_quality_gate
+    name: "准出安全防线门禁"
+    type: QUALITY_GATE
+    dependsOn: ["step_verify_database"]
+    config:
+      rule: "FINANCIAL_CONSISTENCY"
+      condition: "{{ step_verify_database.output.flowStatus }} == 'SETTLED'"
