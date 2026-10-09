@@ -48,3 +48,4 @@ nodes:
     config:
       rule: "ZERO_CAPITAL_LOSS"
       threshold: 100
+# Last verified via TrueOne Web Online Editor
