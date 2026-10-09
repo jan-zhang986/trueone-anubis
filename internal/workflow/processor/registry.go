@@ -6,11 +6,10 @@ import (
 	"sync"
 )
 
-// ProcessorRegistry 统一处理器注册中心（对标 aegis-runner ProcessorRegistry）
+// ProcessorRegistry 统一处理器注册中心（严格对标 aegis-runner ProcessorRegistry）
 type ProcessorRegistry struct {
 	mu         sync.RWMutex
 	processors map[string]ProcessorInterface
-	fallback   ProcessorInterface
 }
 
 var (
@@ -45,27 +44,14 @@ func (r *ProcessorRegistry) Register(p ProcessorInterface) {
 	r.processors[normType] = p
 }
 
-// Get 获取指定类型的处理器（若本地未注册且配置了 fallback 则返回 fallback）
+// Get 获取指定类型的处理器。若未找到则返回 nil, false
 func (r *ProcessorRegistry) Get(procType string) (ProcessorInterface, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	normType := strings.ToUpper(strings.TrimSpace(procType))
 	p, ok := r.processors[normType]
-	if ok {
-		return p, true
-	}
-	if r.fallback != nil {
-		return r.fallback, true
-	}
-	return nil, false
-}
-
-// SetFallback 设置兜底处理器（例如用于向 aegis-runner 远程派发的代理执行器）
-func (r *ProcessorRegistry) SetFallback(p ProcessorInterface) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.fallback = p
+	return p, ok
 }
 
 // List 列出所有已注册处理器的元数据列表

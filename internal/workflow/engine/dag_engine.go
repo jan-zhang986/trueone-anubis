@@ -11,7 +11,6 @@ import (
 	_ "trueone-anubis/internal/workflow/processor/api"
 	_ "trueone-anubis/internal/workflow/processor/data"
 	_ "trueone-anubis/internal/workflow/processor/gate"
-	"trueone-anubis/internal/workflow/processor/remote"
 )
 
 // NodeExecutor 节点执行器接口（保留以兼容历史代码）
@@ -65,11 +64,8 @@ type DAGEngine struct {
 
 // NewDAGEngine 创建并初始化 DAG 引擎，默认绑定全局插件注册中心
 func NewDAGEngine() *DAGEngine {
-	reg := processor.GetRegistry()
-	// 设置远端 Runner 代理处理器作为默认兜底（对齐 aegis-runner 插件扩展能力）
-	reg.SetFallback(remote.NewRunnerProxyProcessor("http://127.0.0.1:8000"))
 	return &DAGEngine{
-		registry: reg,
+		registry: processor.GetRegistry(),
 	}
 }
 

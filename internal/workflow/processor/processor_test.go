@@ -8,7 +8,6 @@ import (
 	_ "trueone-anubis/internal/workflow/processor/api"
 	_ "trueone-anubis/internal/workflow/processor/data"
 	_ "trueone-anubis/internal/workflow/processor/gate"
-	"trueone-anubis/internal/workflow/processor/remote"
 )
 
 func TestProcessorRegistry_BuiltinProcessors(t *testing.T) {
@@ -48,7 +47,7 @@ func TestProcessorRegistry_BuiltinProcessors(t *testing.T) {
 	}
 }
 
-// 模拟测试：第三方外部扩展一个自定义 DUBBO 插件，验证是否完全无需修改任何引擎代码即可即插即用
+// 模拟测试：外部通过统一接口扩展一个新插件（例如 DUBBO），验证是否开箱即用
 type MockDubboProcessor struct {
 	processor.BaseProcessor
 }
@@ -88,25 +87,12 @@ func TestProcessorRegistry_DynamicPluginExtension(t *testing.T) {
 	}
 }
 
-func TestProcessorRegistry_FallbackToRunnerProxy(t *testing.T) {
+func TestProcessorRegistry_UnregisteredTypeReturnsNotFound(t *testing.T) {
 	reg := processor.NewProcessorRegistry()
-	proxy := remote.NewRunnerProxyProcessor("http://127.0.0.1:8000")
-	reg.SetFallback(proxy)
 
-	// 查询一个未注册的 RocketMQ 协议，验证是否命中 Fallback 代理
-	fallbackProc, ok := reg.Get("ROCKETMQ")
-	if !ok {
-		t.Fatalf("未注册类型应自动降级至 RunnerProxy")
-	}
-
-	res, err := fallbackProc.Execute(context.Background(), &processor.ExecutionContext{
-		NodeID:   "step-mq-1",
-		NodeType: "ROCKETMQ",
-	})
-	if err != nil {
-		t.Fatalf("Fallback 执行失败: %v", err)
-	}
-	if res.Evidence["proxy_channel"] != "aegis-runner" {
-		t.Errorf("应通过 aegis-runner 渠道代理执行")
+	// 查询一个未注册的协议，必须严谨地返回 false，杜绝静默假成功
+	_, ok := reg.Get("UNKNOWN_PROTOCOL")
+	if ok {
+		t.Fatalf("未注册的类型必须返回 false，不能被非法匹配")
 	}
 }
