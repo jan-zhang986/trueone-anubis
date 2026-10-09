@@ -50,8 +50,8 @@ type WorkflowGraph struct {
 	Description string                 `json:"description" yaml:"description"`
 	Priority    string                 `json:"priority" yaml:"priority"`
 	Module      string                 `json:"module" yaml:"module"`
-	Tags        []string               `json:"tags" yaml:"tags"`
-	Params      map[string]interface{} `json:"params" yaml:"params"`
+	Variables   map[string]interface{} `json:"variables" yaml:"variables"`                 // 全局变量池 (Test as Code)
+	Params      map[string]interface{} `json:"params,omitempty" yaml:"params,omitempty"`   // 向下兼容旧字段
 	Nodes       []WorkflowNode         `json:"nodes" yaml:"nodes"`
 }
 

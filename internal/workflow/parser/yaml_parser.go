@@ -27,6 +27,17 @@ func ParseWorkflowYAML(content []byte) (*model.WorkflowGraph, error) {
 		graph.Priority = "P0"
 	}
 
+	// 统一归一化为 variables 字段
+	if graph.Variables == nil && graph.Params != nil {
+		graph.Variables = graph.Params
+	} else if graph.Variables != nil && graph.Params != nil {
+		for k, v := range graph.Params {
+			if _, exists := graph.Variables[k]; !exists {
+				graph.Variables[k] = v
+			}
+		}
+	}
+
 	if len(graph.Nodes) == 0 {
 		return nil, fmt.Errorf("工作流必须至少包含一个节点")
 	}

@@ -9,7 +9,7 @@ tags:
   - "order"
   - "reconciliation"
 
-params:
+variables:
   userId: "USR-998811"
   skuId: "SKU-554422"
   orderAmount: 199.00
@@ -24,9 +24,9 @@ nodes:
       headers:
         Authorization: "Bearer mock-token-2026"
       body:
-        userId: "{{ params.userId }}"
-        skuId: "{{ params.skuId }}"
-        amount: "{{ params.orderAmount }}"
+        userId: "{{ variables.userId }}"
+        skuId: "{{ variables.skuId }}"
+        amount: "{{ variables.orderAmount }}"
 
   - id: "step-2-query-ledger"
     name: "校验数据库 trade_ledger 借贷平衡"
@@ -37,7 +37,7 @@ nodes:
       sql: |
         SELECT balance, frozen_amount, debit_amount, credit_amount 
         FROM trade_ledger 
-        WHERE user_id = '{{ params.userId }}'
+        WHERE user_id = '{{ variables.userId }}'
         ORDER BY id DESC LIMIT 1;
 
   - id: "step-3-quality-gate"
@@ -48,4 +48,4 @@ nodes:
     config:
       rule: "ZERO_CAPITAL_LOSS"
       threshold: 100
-# Last verified via TrueOne Web Online Editor
+# Updated to use standard variables keyword

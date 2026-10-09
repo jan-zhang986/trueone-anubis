@@ -79,24 +79,35 @@ func (e *DAGEngine) ExecuteGraph(ctx context.Context, graph *wfModel.WorkflowGra
 	executionID := fmt.Sprintf("wf-exec-%d", startTime.UnixMilli())
 
 	// 初始化全局变量池 (Global Variable Pool)
-	// 合并 Workflow YAML 内定义的 params 与调用方注入的 initParams
-	allParams := make(map[string]interface{})
+	// 合并 Workflow YAML 内定义的 variables (兼容 params) 与调用方注入的入参
+	allVars := make(map[string]interface{})
+	if graph.Variables != nil {
+		for k, v := range graph.Variables {
+			allVars[k] = v
+		}
+	}
 	if graph.Params != nil {
 		for k, v := range graph.Params {
-			allParams[k] = v
+			if _, exists := allVars[k]; !exists {
+				allVars[k] = v
+			}
 		}
 	}
 	if initParams != nil {
 		for k, v := range initParams {
-			allParams[k] = v
+			allVars[k] = v
 		}
 	}
 
 	scope := NewContextScope(map[string]interface{}{
-		"params": allParams,
+		"variables": allVars,
+		"vars":      allVars,
+		"params":    allVars, // 向下兼容
 	})
-	// 快捷支持直接以 params.key 访问或以 key 顶层访问
-	for k, v := range allParams {
+	// 支持以 variables.key / vars.key / key 原生访问
+	for k, v := range allVars {
+		scope.Set("variables."+k, v)
+		scope.Set("vars."+k, v)
 		scope.Set("params."+k, v)
 		scope.Set(k, v)
 	}

@@ -8,7 +8,12 @@ import (
 func TestInterpolateValue(t *testing.T) {
 	scope := NewContextScope(map[string]interface{}{
 		"userId": "USR-998811",
-		"params": map[string]interface{}{
+		"variables": map[string]interface{}{
+			"skuId":       "SKU-554422",
+			"orderAmount": 199.5,
+			"active":      true,
+		},
+		"vars": map[string]interface{}{
 			"skuId":       "SKU-554422",
 			"orderAmount": 199.5,
 			"active":      true,
@@ -20,14 +25,18 @@ func TestInterpolateValue(t *testing.T) {
 		},
 	})
 
-	// 测试 1：全局 params 点路径获取
-	res1 := InterpolateValue("{{ params.skuId }}", scope)
+	// 测试 1：全局 variables / vars 点路径获取
+	res1 := InterpolateValue("{{ variables.skuId }}", scope)
 	if res1 != "SKU-554422" {
 		t.Fatalf("expected SKU-554422, got %v", res1)
 	}
+	res1b := InterpolateValue("{{ vars.skuId }}", scope)
+	if res1b != "SKU-554422" {
+		t.Fatalf("expected SKU-554422, got %v", res1b)
+	}
 
 	// 测试 2：保留原始非字符串类型 (float64)
-	res2 := InterpolateValue("{{ params.orderAmount }}", scope)
+	res2 := InterpolateValue("{{ variables.orderAmount }}", scope)
 	if !reflect.DeepEqual(res2, 199.5) {
 		t.Fatalf("expected 199.5 (float), got %v (type %T)", res2, res2)
 	}
