@@ -12,6 +12,7 @@ type CaseRepository struct {
 	GitPlatform   string `gorm:"column:git_platform;size:50" json:"gitPlatform"` // "github" | "gitlab" | "local"
 	TestsDir      string `gorm:"column:tests_dir;size:255" json:"testsDir"`
 	LocalPath     string `gorm:"column:local_path;size:500" json:"localPath"`
+	GitToken      string `gorm:"column:git_token;size:500" json:"gitToken,omitempty"`
 	CaseCount     int    `gorm:"column:case_count" json:"caseCount"`
 	CreatedAt     int64  `gorm:"column:created_at" json:"createdAt"`
 	UpdatedAt     int64  `gorm:"column:updated_at" json:"updatedAt"`

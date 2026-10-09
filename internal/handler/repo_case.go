@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -732,6 +734,7 @@ func (h *RepoCaseHandler) ListRepositories(c *gin.Context) {
 		GitPlatform   string   `json:"gitPlatform"`
 		TestsDir      string   `json:"testsDir"`
 		LocalPath     string   `json:"localPath"`
+		GitToken      string   `json:"gitToken,omitempty"`
 		CaseCount     int      `json:"caseCount"`
 		UpdatedAt     int64    `json:"updatedAt"`
 	}
@@ -755,6 +758,7 @@ func (h *RepoCaseHandler) ListRepositories(c *gin.Context) {
 			GitPlatform:   r.GitPlatform,
 			TestsDir:      r.TestsDir,
 			LocalPath:     r.LocalPath,
+			GitToken:      r.GitToken,
 			CaseCount:     r.CaseCount,
 			UpdatedAt:     r.UpdatedAt,
 		})
@@ -769,6 +773,7 @@ func (h *RepoCaseHandler) CreateRepository(c *gin.Context) {
 		Name          string `json:"name" binding:"required"`
 		LocalPath     string `json:"localPath"`
 		GitURL        string `json:"gitUrl"`
+		GitToken      string `json:"gitToken"`
 		DefaultBranch string `json:"defaultBranch"`
 		TestsDir      string `json:"testsDir"`
 		Description   string `json:"description"`
@@ -825,6 +830,7 @@ func (h *RepoCaseHandler) CreateRepository(c *gin.Context) {
 		GitPlatform:   gitPlatform,
 		TestsDir:      testsDir,
 		LocalPath:     localPath,
+		GitToken:      body.GitToken,
 		CaseCount:     0,
 		CreatedAt:     now,
 		UpdatedAt:     now,
@@ -1184,7 +1190,97 @@ type CommitCodeRequest struct {
 	Author        string `json:"author"`
 }
 
-// CommitCode 在线修改测试代码并提交/推送到 Git 远端 (GitHub)
+// commitViaGitHubAPI 通过 GitHub REST API 直接创建或更新文件并提交
+func commitViaGitHubAPI(gitURL, token, branch, filePath, codeContent, commitMsg, authorName, authorEmail string) (string, error) {
+	owner, repoName := parseGitHubRepoURL(gitURL)
+	if owner == "" || repoName == "" {
+		return "", fmt.Errorf("无法解析 GitHub 仓库地址: %s", gitURL)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	cleanPath := strings.TrimPrefix(filePath, "/")
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", owner, repoName, cleanPath)
+
+	// 1. 先尝试获取已有文件的 sha (如果文件已存在，更新时必须携带 sha)
+	var existingSha string
+	getReq, err := http.NewRequest("GET", fmt.Sprintf("%s?ref=%s", apiURL, branch), nil)
+	if err == nil {
+		getReq.Header.Set("Authorization", "Bearer "+token)
+		getReq.Header.Set("Accept", "application/vnd.github+json")
+		getReq.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
+		if getResp, err := client.Do(getReq); err == nil {
+			defer getResp.Body.Close()
+			if getResp.StatusCode == http.StatusOK {
+				var fileInfo struct {
+					Sha string `json:"sha"`
+				}
+				_ = json.NewDecoder(getResp.Body).Decode(&fileInfo)
+				existingSha = fileInfo.Sha
+			}
+		}
+	}
+
+	// 2. 构造 PUT 请求体
+	encodedContent := base64.StdEncoding.EncodeToString([]byte(codeContent))
+	putBody := map[string]interface{}{
+		"message": commitMsg,
+		"content": encodedContent,
+		"branch":  branch,
+	}
+	if existingSha != "" {
+		putBody["sha"] = existingSha
+	}
+	if authorName != "" {
+		if authorEmail == "" {
+			authorEmail = "qa-bot@trueone.io"
+		}
+		putBody["committer"] = map[string]string{
+			"name":  authorName,
+			"email": authorEmail,
+		}
+	}
+
+	bodyBytes, _ := json.Marshal(putBody)
+	putReq, err := http.NewRequest("PUT", apiURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+	putReq.Header.Set("Authorization", "Bearer "+token)
+	putReq.Header.Set("Accept", "application/vnd.github+json")
+	putReq.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
+	putReq.Header.Set("Content-Type", "application/json")
+
+	putResp, err := client.Do(putReq)
+	if err != nil {
+		return "", fmt.Errorf("请求 GitHub API 失败: %w", err)
+	}
+	defer putResp.Body.Close()
+
+	respBytes, _ := io.ReadAll(putResp.Body)
+	if putResp.StatusCode != http.StatusOK && putResp.StatusCode != http.StatusCreated {
+		var errResp struct {
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(respBytes, &errResp)
+		errMsg := errResp.Message
+		if errMsg == "" {
+			errMsg = string(respBytes)
+		}
+		return "", fmt.Errorf("GitHub API 拒绝提交 (HTTP %d): %s", putResp.StatusCode, errMsg)
+	}
+
+	var result struct {
+		Commit struct {
+			Sha     string `json:"sha"`
+			Message string `json:"message"`
+			HTMLURL string `json:"html_url"`
+		} `json:"commit"`
+	}
+	_ = json.Unmarshal(respBytes, &result)
+	return result.Commit.Sha, nil
+}
+
+// CommitCode 在线修改测试代码并提交/推送到 Git 远端 (支持 GitHub REST API 纯云端无状态模式 与 本地 Git CLI 双模自适应)
 func (h *RepoCaseHandler) CommitCode(c *gin.Context) {
 	id := c.Param("id")
 	var req CommitCodeRequest
@@ -1225,8 +1321,52 @@ func (h *RepoCaseHandler) CommitCode(c *gin.Context) {
 		}
 	}
 
+	// 优先检查 Token (仓库级配置或环境变量 GITHUB_TOKEN)
+	gitToken := repo.GitToken
+	if gitToken == "" {
+		gitToken = os.Getenv("GITHUB_TOKEN")
+	}
+
+	// 如果配置了 Token 且目标为 GitHub 仓库，优先直接走纯云端无状态 GitHub REST API
+	if gitToken != "" && strings.Contains(repo.GitURL, "github.com") {
+		authorName := req.Author
+		if authorName == "" {
+			authorName = "TrueOne Web Architect"
+		}
+		commitSha, err := commitViaGitHubAPI(repo.GitURL, gitToken, branch, req.FilePath, req.CodeContent, commitMsg, authorName, "qa@trueone.io")
+		if err == nil {
+			// 同步写入本地文件（若本地工作区存在）保持一致
+			if localBase != "" {
+				fullPath := filepath.Join(localBase, req.FilePath)
+				_ = os.MkdirAll(filepath.Dir(fullPath), 0755)
+				_ = os.WriteFile(fullPath, []byte(req.CodeContent), 0644)
+			}
+
+			shortSha := commitSha
+			if len(shortSha) > 7 {
+				shortSha = shortSha[:7]
+			}
+
+			response.Success(c, gin.H{
+				"commitSha": commitSha,
+				"pushed":    true,
+				"branch":    branch,
+				"mode":      "GITHUB_REST_API",
+				"message":   fmt.Sprintf("已通过 GitHub REST API 直接提交至远端 %s 分支 (commit: %s)", branch, shortSha),
+			})
+			return
+		}
+
+		// 若云端 API 提交失败且本地工作区不存在，直接报错
+		if localBase == "" {
+			response.Fail(c, 500, fmt.Sprintf("GitHub API 提交失败: %v", err))
+			return
+		}
+		// 否则自动降级尝试本地 Git CLI 提交流程
+	}
+
 	if localBase == "" {
-		response.Fail(c, 500, "未找到本地 Git 工作区，无法执行本地提交推送")
+		response.Fail(c, 500, "未配置 Git Token 且未找到本地 Git 工作区，无法执行提交")
 		return
 	}
 
