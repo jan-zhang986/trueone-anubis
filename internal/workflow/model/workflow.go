@@ -57,13 +57,14 @@ type WorkflowGraph struct {
 
 // NodeExecutionResult 单个节点的执行快照与证据
 type NodeExecutionResult struct {
-	NodeID     string                 `json:"nodeId"`
-	NodeName   string                 `json:"nodeName"`
-	Status     NodeStatus             `json:"status"`
-	DurationMs int64                  `json:"durationMs"`
-	Error      string                 `json:"error,omitempty"`
-	Output     map[string]interface{} `json:"output,omitempty"` // 产出变量供下游节点消费
-	Evidence   map[string]interface{} `json:"evidence,omitempty"` // 捕获的断言/DB快照
+	NodeID         string                 `json:"nodeId"`
+	NodeName       string                 `json:"nodeName"`
+	Status         NodeStatus             `json:"status"`
+	DurationMs     int64                  `json:"durationMs"`
+	Error          string                 `json:"error,omitempty"`
+	ResolvedConfig map[string]interface{} `json:"resolvedConfig,omitempty"` // 全局变量池插值渲染后的实际执行配置
+	Output         map[string]interface{} `json:"output,omitempty"`         // 产出变量供下游节点消费
+	Evidence       map[string]interface{} `json:"evidence,omitempty"`       // 捕获的断言/DB快照
 }
 
 // WorkflowExecutionResult 整个 DAG 执行报告

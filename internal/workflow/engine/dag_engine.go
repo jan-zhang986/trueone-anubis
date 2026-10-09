@@ -77,7 +77,29 @@ func (e *DAGEngine) RegisterExecutor(nodeType wfModel.NodeType, executor NodeExe
 func (e *DAGEngine) ExecuteGraph(ctx context.Context, graph *wfModel.WorkflowGraph, initParams map[string]interface{}) (*wfModel.WorkflowExecutionResult, error) {
 	startTime := time.Now()
 	executionID := fmt.Sprintf("wf-exec-%d", startTime.UnixMilli())
-	scope := NewContextScope(initParams)
+
+	// 初始化全局变量池 (Global Variable Pool)
+	// 合并 Workflow YAML 内定义的 params 与调用方注入的 initParams
+	allParams := make(map[string]interface{})
+	if graph.Params != nil {
+		for k, v := range graph.Params {
+			allParams[k] = v
+		}
+	}
+	if initParams != nil {
+		for k, v := range initParams {
+			allParams[k] = v
+		}
+	}
+
+	scope := NewContextScope(map[string]interface{}{
+		"params": allParams,
+	})
+	// 快捷支持直接以 params.key 访问或以 key 顶层访问
+	for k, v := range allParams {
+		scope.Set("params."+k, v)
+		scope.Set(k, v)
+	}
 
 	nodeMap := make(map[string]*wfModel.WorkflowNode)
 	inDegree := make(map[string]int)
@@ -120,24 +142,43 @@ func (e *DAGEngine) ExecuteGraph(ctx context.Context, graph *wfModel.WorkflowGra
 		var res *wfModel.NodeExecutionResult
 		var err error
 
+		// 执行前进行全局变量池插值替换 (Interpolation)
+		resolvedConfig := InterpolateConfig(node.Config, scope)
+		execNode := *node
+		execNode.Config = resolvedConfig
+
 		if !exists {
 			res = &wfModel.NodeExecutionResult{
-				NodeID:     node.ID,
-				NodeName:   node.Name,
-				Status:     wfModel.NodeStatusFailed,
-				DurationMs: time.Since(nodeStart).Milliseconds(),
-				Error:      fmt.Sprintf("unsupported node type: %s", node.Type),
+				NodeID:         node.ID,
+				NodeName:       node.Name,
+				Status:         wfModel.NodeStatusFailed,
+				DurationMs:     time.Since(nodeStart).Milliseconds(),
+				ResolvedConfig: resolvedConfig,
+				Error:          fmt.Sprintf("unsupported node type: %s", node.Type),
 			}
 		} else {
-			res, err = executor.Execute(ctx, node, scope)
+			res, err = executor.Execute(ctx, &execNode, scope)
 			if err != nil && res == nil {
 				res = &wfModel.NodeExecutionResult{
-					NodeID:     node.ID,
-					NodeName:   node.Name,
-					Status:     wfModel.NodeStatusFailed,
-					DurationMs: time.Since(nodeStart).Milliseconds(),
-					Error:      err.Error(),
+					NodeID:         node.ID,
+					NodeName:       node.Name,
+					Status:         wfModel.NodeStatusFailed,
+					DurationMs:     time.Since(nodeStart).Milliseconds(),
+					ResolvedConfig: resolvedConfig,
+					Error:          err.Error(),
 				}
+			} else if res != nil {
+				res.ResolvedConfig = resolvedConfig
+			}
+		}
+
+		// 将节点输出注册回全局变量池，供后续下游依赖消费
+		if res != nil && res.Output != nil {
+			scope.Set(nodeID, map[string]interface{}{"output": res.Output})
+			scope.Set(nodeID+".output", res.Output)
+			scope.Set("nodes."+nodeID+".output", res.Output)
+			for outK, outV := range res.Output {
+				scope.Set(fmt.Sprintf("%s.output.%s", nodeID, outK), outV)
 			}
 		}
 
