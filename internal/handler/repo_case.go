@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -58,6 +59,21 @@ func ensureDefaultRepo() {
 			UpdatedAt:     now,
 		}
 		config.DB.Create(&defaultRepo)
+	} else {
+		// 对数据库中本地路径为空的仓库，尝试自动回填本地有效工作区路径
+		var emptyRepos []model.CaseRepository
+		config.DB.Where("local_path = '' OR local_path IS NULL").Find(&emptyRepos)
+		probeDir := "/Users/zhangjian/vanguard-platform/trueone-anubis"
+		if fi, err := os.Stat(probeDir); err == nil && fi.IsDir() {
+			for _, r := range emptyRepos {
+				if r.TestsDir == "" {
+					r.TestsDir = "tests"
+				}
+				if _, err := os.Stat(filepath.Join(probeDir, r.TestsDir)); err == nil {
+					config.DB.Model(&model.CaseRepository{}).Where("id = ?", r.ID).Update("local_path", probeDir)
+				}
+			}
+		}
 	}
 }
 
@@ -289,7 +305,116 @@ func parseWorkflowYamlContent(content string, relPath string, gitRepoURL string,
 	return tc, nil
 }
 
-// 从 GitHub 云端动态拉取并解析特定仓库
+// 构建规范的递归目录树结构
+func buildHierarchicalTree(rootPath, rootTitle string, fileCases map[string]int, defaultDirs []string, owner, repoName, branch string, isCloud bool) *RepoTreeNodeItem {
+	root := &RepoTreeNodeItem{
+		ID:        "root",
+		Name:      rootTitle,
+		Path:      rootPath,
+		Type:      "folder",
+		PassRate:  100,
+		Children:  []*RepoTreeNodeItem{},
+	}
+	if isCloud && owner != "" && repoName != "" {
+		root.GitURL = fmt.Sprintf("https://github.com/%s/%s/tree/%s/%s", owner, repoName, branch, rootPath)
+	}
+
+	folderMap := make(map[string]*RepoTreeNodeItem)
+	folderMap[rootPath] = root
+
+	// 预先注册一级子目录
+	for _, dirName := range defaultDirs {
+		if dirName == "" {
+			continue
+		}
+		dirPath := rootPath + "/" + dirName
+		fNode := &RepoTreeNodeItem{
+			ID:       "folder-" + strings.ReplaceAll(dirPath, "/", "-"),
+			Name:     dirName,
+			Path:     dirPath,
+			Type:     "folder",
+			PassRate: 100,
+			Children: []*RepoTreeNodeItem{},
+		}
+		if isCloud && owner != "" && repoName != "" {
+			fNode.GitURL = fmt.Sprintf("https://github.com/%s/%s/tree/%s/%s", owner, repoName, branch, dirPath)
+		}
+		folderMap[dirPath] = fNode
+		root.Children = append(root.Children, fNode)
+	}
+
+	var filePaths []string
+	for p := range fileCases {
+		filePaths = append(filePaths, filepath.ToSlash(p))
+	}
+	sort.Strings(filePaths)
+
+	for _, p := range filePaths {
+		count := fileCases[p]
+		parts := strings.Split(p, "/")
+		currentParent := root
+		currentPath := ""
+		for i := 0; i < len(parts)-1; i++ {
+			if currentPath == "" {
+				currentPath = parts[i]
+			} else {
+				currentPath = currentPath + "/" + parts[i]
+			}
+			if currentPath == rootPath {
+				continue
+			}
+			folderNode, exists := folderMap[currentPath]
+			if !exists {
+				folderNode = &RepoTreeNodeItem{
+					ID:       "folder-" + strings.ReplaceAll(currentPath, "/", "-"),
+					Name:     parts[i],
+					Path:     currentPath,
+					Type:     "folder",
+					PassRate: 100,
+					Children: []*RepoTreeNodeItem{},
+				}
+				if isCloud && owner != "" && repoName != "" {
+					folderNode.GitURL = fmt.Sprintf("https://github.com/%s/%s/tree/%s/%s", owner, repoName, branch, currentPath)
+				}
+				folderMap[currentPath] = folderNode
+				currentParent.Children = append(currentParent.Children, folderNode)
+			}
+			currentParent = folderNode
+		}
+
+		fileName := parts[len(parts)-1]
+		fileNode := &RepoTreeNodeItem{
+			ID:        "file-" + strings.ReplaceAll(p, "/", "-"),
+			Name:      fileName,
+			Path:      p,
+			Type:      "file",
+			CaseCount: count,
+			PassRate:  100,
+		}
+		if isCloud && owner != "" && repoName != "" {
+			fileNode.GitURL = fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s", owner, repoName, branch, p)
+		}
+		currentParent.Children = append(currentParent.Children, fileNode)
+	}
+
+	var calcCount func(node *RepoTreeNodeItem) int
+	calcCount = func(node *RepoTreeNodeItem) int {
+		if node.Type == "file" {
+			return node.CaseCount
+		}
+		total := 0
+		for _, child := range node.Children {
+			total += calcCount(child)
+		}
+		node.CaseCount = total
+		return total
+	}
+	calcCount(root)
+
+	return root
+}
+
+// 从 GitHub 云端动态拉取并解析特定仓库 (支持 Git Trees 递归检索与子目录用例解析)
 func fetchCloudRepoCases(repo model.CaseRepository, branch string) ([]UnifiedTestCaseItem, *RepoTreeNodeItem, error) {
 	owner, repoName := parseGitHubRepoURL(repo.GitURL)
 	if owner == "" || repoName == "" {
@@ -306,108 +431,177 @@ func fetchCloudRepoCases(repo model.CaseRepository, branch string) ([]UnifiedTes
 		testsDir = "tests"
 	}
 
-	client := &http.Client{Timeout: 4 * time.Second}
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", owner, repoName, testsDir, branch)
-
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	req.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
-
-	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("github api 请求失败: %v", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	var items []GitHubContentItem
-	if err := json.Unmarshal(bodyBytes, &items); err != nil {
-		return nil, nil, err
-	}
-
+	client := &http.Client{Timeout: 8 * time.Second}
 	var allCases []UnifiedTestCaseItem
 	fileCaseMap := make(map[string]int)
+	var defaultDirs []string
 
-	for _, item := range items {
-		if item.Type == "file" && item.DownloadURL != "" {
-			if strings.HasSuffix(item.Name, "_test.go") {
-				fileResp, err := client.Get(item.DownloadURL)
-				if err == nil && fileResp.StatusCode == http.StatusOK {
-					fBytes, _ := io.ReadAll(fileResp.Body)
-					_ = fileResp.Body.Close()
-					cases := parseGoTestContent(string(fBytes), item.Path, repo.GitURL, branch, true)
-					fileCaseMap[item.Name] = len(cases)
-					allCases = append(allCases, cases...)
-				}
-			} else if isWorkflowFile(item.Name) {
-				fileResp, err := client.Get(item.DownloadURL)
-				if err == nil && fileResp.StatusCode == http.StatusOK {
-					fBytes, _ := io.ReadAll(fileResp.Body)
-					_ = fileResp.Body.Close()
-					wfCase, err := parseWorkflowYamlContent(string(fBytes), item.Path, repo.GitURL, branch, true)
-					if err == nil && wfCase != nil {
-						fileCaseMap[item.Name] = 1
-						allCases = append(allCases, *wfCase)
+	// 1. 优先尝试通过 GitHub Git Trees API 递归获取整棵目录树
+	treeAPIURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/trees/%s?recursive=1", owner, repoName, branch)
+	treeReq, err := http.NewRequest("GET", treeAPIURL, nil)
+	useTreeAPI := false
+	if err == nil {
+		treeReq.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
+		treeResp, err := client.Do(treeReq)
+		if err == nil && treeResp.StatusCode == http.StatusOK {
+			defer treeResp.Body.Close()
+			var treeData struct {
+				Tree []struct {
+					Path string `json:"path"`
+					Type string `json:"type"`
+				} `json:"tree"`
+			}
+			if json.NewDecoder(treeResp.Body).Decode(&treeData) == nil {
+				useTreeAPI = true
+				prefix := testsDir + "/"
+				for _, item := range treeData.Tree {
+					if item.Type == "tree" && strings.HasPrefix(item.Path, prefix) {
+						rel := strings.TrimPrefix(item.Path, prefix)
+						if !strings.Contains(rel, "/") {
+							defaultDirs = append(defaultDirs, rel)
+						}
+					} else if item.Type == "blob" && (strings.HasPrefix(item.Path, prefix) || item.Path == testsDir) {
+						fileName := filepath.Base(item.Path)
+						if strings.HasSuffix(fileName, "_test.go") || isWorkflowFile(fileName) {
+							rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repoName, branch, item.Path)
+							rawResp, rErr := client.Get(rawURL)
+							if rErr == nil && rawResp.StatusCode == http.StatusOK {
+								fBytes, _ := io.ReadAll(rawResp.Body)
+								_ = rawResp.Body.Close()
+								if strings.HasSuffix(fileName, "_test.go") {
+									cases := parseGoTestContent(string(fBytes), item.Path, repo.GitURL, branch, true)
+									if len(cases) > 0 {
+										fileCaseMap[item.Path] = len(cases)
+										allCases = append(allCases, cases...)
+									}
+								} else if isWorkflowFile(fileName) {
+									wfCase, wErr := parseWorkflowYamlContent(string(fBytes), item.Path, repo.GitURL, branch, true)
+									if wErr == nil && wfCase != nil {
+										fileCaseMap[item.Path] = 1
+										allCases = append(allCases, *wfCase)
+									}
+								}
+							}
+						}
 					}
 				}
 			}
 		}
 	}
 
-	root := &RepoTreeNodeItem{
-		ID:        "root",
-		Name:      fmt.Sprintf("%s (%s 云端分支)", testsDir, branch),
-		Path:      testsDir,
-		Type:      "folder",
-		CaseCount: len(allCases),
-		PassRate:  100,
-		GitURL:    fmt.Sprintf("https://github.com/%s/%s/tree/%s/%s", owner, repoName, branch, testsDir),
-		Children:  []*RepoTreeNodeItem{},
-	}
+	// 2. 如果 Tree API 失败，降级回 contents API 并探测子目录
+	if !useTreeAPI {
+		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", owner, repoName, testsDir, branch)
+		req, err := http.NewRequest("GET", apiURL, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			return nil, nil, fmt.Errorf("github api 请求失败: %v", err)
+		}
+		defer resp.Body.Close()
 
-	for _, item := range items {
-		if item.Type == "dir" {
-			root.Children = append(root.Children, &RepoTreeNodeItem{
-				ID:        "folder-" + item.Name,
-				Name:      item.Name,
-				Path:      item.Path,
-				Type:      "folder",
-				CaseCount: 0,
-				GitURL:    item.HTMLURL,
-			})
-		} else if strings.HasSuffix(item.Name, "_test.go") || isWorkflowFile(item.Name) {
-			count := fileCaseMap[item.Name]
-			root.Children = append(root.Children, &RepoTreeNodeItem{
-				ID:        "file-" + item.Name,
-				Name:      item.Name,
-				Path:      item.Path,
-				Type:      "file",
-				CaseCount: count,
-				PassRate:  100,
-				GitURL:    item.HTMLURL,
-			})
+		var items []GitHubContentItem
+		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+			return nil, nil, err
+		}
+
+		for _, item := range items {
+			if item.Type == "dir" {
+				defaultDirs = append(defaultDirs, item.Name)
+				// 针对 e2e、qa 等重要子目录进行二级探测拉取
+				subURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", owner, repoName, item.Path, branch)
+				subReq, _ := http.NewRequest("GET", subURL, nil)
+				subReq.Header.Set("User-Agent", "TrueOne-Universal-Git-Scanner/2.0")
+				if subResp, sErr := client.Do(subReq); sErr == nil && subResp.StatusCode == http.StatusOK {
+					var subItems []GitHubContentItem
+					_ = json.NewDecoder(subResp.Body).Decode(&subItems)
+					subResp.Body.Close()
+					for _, sItem := range subItems {
+						if sItem.Type == "file" && sItem.DownloadURL != "" {
+							if isWorkflowFile(sItem.Name) || strings.HasSuffix(sItem.Name, "_test.go") {
+								fResp, fErr := client.Get(sItem.DownloadURL)
+								if fErr == nil && fResp.StatusCode == http.StatusOK {
+									fBytes, _ := io.ReadAll(fResp.Body)
+									_ = fResp.Body.Close()
+									if isWorkflowFile(sItem.Name) {
+										wfCase, wErr := parseWorkflowYamlContent(string(fBytes), sItem.Path, repo.GitURL, branch, true)
+										if wErr == nil && wfCase != nil {
+											fileCaseMap[sItem.Path] = 1
+											allCases = append(allCases, *wfCase)
+										}
+									} else {
+										cList := parseGoTestContent(string(fBytes), sItem.Path, repo.GitURL, branch, true)
+										if len(cList) > 0 {
+											fileCaseMap[sItem.Path] = len(cList)
+											allCases = append(allCases, cList...)
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			} else if item.Type == "file" && item.DownloadURL != "" {
+				if strings.HasSuffix(item.Name, "_test.go") {
+					fileResp, err := client.Get(item.DownloadURL)
+					if err == nil && fileResp.StatusCode == http.StatusOK {
+						fBytes, _ := io.ReadAll(fileResp.Body)
+						_ = fileResp.Body.Close()
+						cases := parseGoTestContent(string(fBytes), item.Path, repo.GitURL, branch, true)
+						if len(cases) > 0 {
+							fileCaseMap[item.Path] = len(cases)
+							allCases = append(allCases, cases...)
+						}
+					}
+				} else if isWorkflowFile(item.Name) {
+					fileResp, err := client.Get(item.DownloadURL)
+					if err == nil && fileResp.StatusCode == http.StatusOK {
+						fBytes, _ := io.ReadAll(fileResp.Body)
+						_ = fileResp.Body.Close()
+						wfCase, err := parseWorkflowYamlContent(string(fBytes), item.Path, repo.GitURL, branch, true)
+						if err == nil && wfCase != nil {
+							fileCaseMap[item.Path] = 1
+							allCases = append(allCases, *wfCase)
+						}
+					}
+				}
+			}
 		}
 	}
 
+	root := buildHierarchicalTree(testsDir, fmt.Sprintf("%s (%s 云端分支)", testsDir, branch), fileCaseMap, defaultDirs, owner, repoName, branch, true)
 	return allCases, root, nil
 }
 
-// 本地扫描回退/本地工作区扫描
+// 本地工作区扫描 (深度遍历 tests 目录及 e2e 等所有子目录)
 func fetchLocalRepoCases(repo model.CaseRepository, branch string) ([]UnifiedTestCaseItem, *RepoTreeNodeItem, error) {
 	basePath := repo.LocalPath
 	if basePath == "" {
-		basePath = "/Users/zhangjian/vanguard-platform/trueone-anubis"
+		for _, probe := range []string{
+			"/Users/zhangjian/vanguard-platform/trueone-anubis",
+			".",
+		} {
+			if fi, err := os.Stat(probe); err == nil && fi.IsDir() {
+				basePath = probe
+				break
+			}
+		}
 	}
-	testsDir := filepath.Join(basePath, repo.TestsDir)
+	testsDirName := repo.TestsDir
+	if testsDirName == "" {
+		testsDirName = "tests"
+	}
+	testsDir := filepath.Join(basePath, testsDirName)
 	if _, err := os.Stat(testsDir); err != nil {
 		testsDir = filepath.Join(basePath, "tests")
+		testsDirName = "tests"
 	}
 
 	var allCases []UnifiedTestCaseItem
 	fileCaseMap := make(map[string]int)
-	folderCaseMap := make(map[string]int)
 
 	_ = filepath.Walk(testsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -415,66 +609,41 @@ func fetchLocalRepoCases(repo model.CaseRepository, branch string) ([]UnifiedTes
 		}
 		name := info.Name()
 		rel, _ := filepath.Rel(basePath, path)
-		relFromTests, _ := filepath.Rel(testsDir, path)
-		topFolder := strings.Split(filepath.ToSlash(relFromTests), "/")[0]
+		rel = filepath.ToSlash(rel)
 
 		if strings.HasSuffix(name, "_test.go") {
-			bytes, _ := os.ReadFile(path)
-			cList := parseGoTestContent(string(bytes), rel, repo.GitURL, branch, false)
-			fileCaseMap[name] += len(cList)
-			if topFolder != name {
-				folderCaseMap[topFolder] += len(cList)
-			}
-			allCases = append(allCases, cList...)
-		} else if isWorkflowFile(name) {
-			bytes, _ := os.ReadFile(path)
-			wfCase, err := parseWorkflowYamlContent(string(bytes), rel, repo.GitURL, branch, false)
-			if err == nil && wfCase != nil {
-				fileCaseMap[name] += 1
-				if topFolder != name {
-					folderCaseMap[topFolder] += 1
+			bytes, err := os.ReadFile(path)
+			if err == nil {
+				cList := parseGoTestContent(string(bytes), rel, repo.GitURL, branch, false)
+				if len(cList) > 0 {
+					fileCaseMap[rel] = len(cList)
+					allCases = append(allCases, cList...)
 				}
-				allCases = append(allCases, *wfCase)
+			}
+		} else if isWorkflowFile(name) {
+			bytes, err := os.ReadFile(path)
+			if err == nil {
+				wfCase, err := parseWorkflowYamlContent(string(bytes), rel, repo.GitURL, branch, false)
+				if err == nil && wfCase != nil {
+					fileCaseMap[rel] = 1
+					allCases = append(allCases, *wfCase)
+				}
 			}
 		}
 		return nil
 	})
 
-	root := &RepoTreeNodeItem{
-		ID:        "root",
-		Name:      fmt.Sprintf("%s (本地扫描)", repo.TestsDir),
-		Path:      repo.TestsDir,
-		Type:      "folder",
-		CaseCount: len(allCases),
-		PassRate:  100,
-		Children:  []*RepoTreeNodeItem{},
-	}
-
-	entries, _ := os.ReadDir(testsDir)
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() {
-			count := folderCaseMap[name]
-			root.Children = append(root.Children, &RepoTreeNodeItem{
-				ID:        "folder-" + name,
-				Name:      name,
-				Path:      filepath.Join(repo.TestsDir, name),
-				Type:      "folder",
-				CaseCount: count,
-			})
-		} else if strings.HasSuffix(name, "_test.go") || isWorkflowFile(name) {
-			count := fileCaseMap[name]
-			root.Children = append(root.Children, &RepoTreeNodeItem{
-				ID:        "file-" + name,
-				Name:      name,
-				Path:      filepath.Join(repo.TestsDir, name),
-				Type:      "file",
-				CaseCount: count,
-				PassRate:  100,
-			})
+	var defaultDirs []string
+	if entries, err := os.ReadDir(testsDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				defaultDirs = append(defaultDirs, entry.Name())
+			}
 		}
 	}
 
+	owner, repoName := parseGitHubRepoURL(repo.GitURL)
+	root := buildHierarchicalTree(testsDirName, fmt.Sprintf("%s (本地工作区)", testsDirName), fileCaseMap, defaultDirs, owner, repoName, branch, false)
 	return allCases, root, nil
 }
 
@@ -493,8 +662,38 @@ func getRepoCasesDynamic(repoID, branch string) ([]UnifiedTestCaseItem, *RepoTre
 			branch = "main"
 		}
 	}
+	if repo.TestsDir == "" {
+		repo.TestsDir = "tests"
+	}
 
-	// 如果配置了 GitHub 地址，优先从 GitHub 云端动态拉取
+	// 1. 本地优先：若配置了本地路径或当前运行环境存在对应的 tests 目录，优先从本地极速加载
+	//    本地扫描无网络延迟、能即时感知本地编写的 YAML/Go 用例，且彻底避免 GitHub API 匿名限流
+	localBase := repo.LocalPath
+	if localBase == "" {
+		for _, probe := range []string{
+			"/Users/zhangjian/vanguard-platform/trueone-anubis",
+			".",
+		} {
+			if fi, err := os.Stat(filepath.Join(probe, repo.TestsDir)); err == nil && fi.IsDir() {
+				localBase = probe
+				// 自动写回数据库保证持久化
+				config.DB.Model(&model.CaseRepository{}).Where("id = ?", repo.ID).Update("local_path", probe)
+				break
+			}
+		}
+	}
+
+	if localBase != "" {
+		testDir := filepath.Join(localBase, repo.TestsDir)
+		if fi, err := os.Stat(testDir); err == nil && fi.IsDir() {
+			cases, tree, err := fetchLocalRepoCases(repo, branch)
+			if err == nil && len(cases) > 0 {
+				return cases, tree
+			}
+		}
+	}
+
+	// 2. 否则如果配置了 GitHub 地址，从 GitHub 云端拉取
 	if strings.Contains(repo.GitURL, "github.com") {
 		cases, tree, err := fetchCloudRepoCases(repo, branch)
 		if err == nil && len(cases) > 0 {
@@ -502,7 +701,7 @@ func getRepoCasesDynamic(repoID, branch string) ([]UnifiedTestCaseItem, *RepoTre
 		}
 	}
 
-	// 否则或降级执行本地扫描
+	// 3. 兜底执行本地扫描
 	cases, tree, _ := fetchLocalRepoCases(repo, branch)
 	return cases, tree
 }
