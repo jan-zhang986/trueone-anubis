@@ -7,9 +7,14 @@ import (
 	"time"
 
 	wfModel "trueone-anubis/internal/workflow/model"
+	"trueone-anubis/internal/workflow/processor"
+	_ "trueone-anubis/internal/workflow/processor/api"
+	_ "trueone-anubis/internal/workflow/processor/data"
+	_ "trueone-anubis/internal/workflow/processor/gate"
+	"trueone-anubis/internal/workflow/processor/remote"
 )
 
-// NodeExecutor 节点执行器接口
+// NodeExecutor 节点执行器接口（保留以兼容历史代码）
 type NodeExecutor interface {
 	Execute(ctx context.Context, node *wfModel.WorkflowNode, scope *ContextScope) (*wfModel.NodeExecutionResult, error)
 }
@@ -53,24 +58,68 @@ func (s *ContextScope) Snapshot() map[string]interface{} {
 	return snap
 }
 
-// DAGEngine 原生高性能有向无环图调度引擎
+// DAGEngine 插件化、高性能有向无环图调度引擎（微内核架构）
 type DAGEngine struct {
-	executors map[wfModel.NodeType]NodeExecutor
+	registry *processor.ProcessorRegistry
 }
 
+// NewDAGEngine 创建并初始化 DAG 引擎，默认绑定全局插件注册中心
 func NewDAGEngine() *DAGEngine {
-	e := &DAGEngine{
-		executors: make(map[wfModel.NodeType]NodeExecutor),
+	reg := processor.GetRegistry()
+	// 设置远端 Runner 代理处理器作为默认兜底（对齐 aegis-runner 插件扩展能力）
+	reg.SetFallback(remote.NewRunnerProxyProcessor("http://127.0.0.1:8000"))
+	return &DAGEngine{
+		registry: reg,
 	}
-	// 注册默认处理器
-	e.RegisterExecutor(wfModel.NodeTypeHTTP, &DefaultHTTPExecutor{})
-	e.RegisterExecutor(wfModel.NodeTypeSQL, &DefaultSQLExecutor{})
-	e.RegisterExecutor(wfModel.NodeTypeQualityGate, &DefaultQualityGateExecutor{})
-	return e
 }
 
+// NewDAGEngineWithRegistry 允许注入自定义注册中心
+func NewDAGEngineWithRegistry(reg *processor.ProcessorRegistry) *DAGEngine {
+	return &DAGEngine{
+		registry: reg,
+	}
+}
+
+// RegisterProcessor 注册新节点处理器插件（对齐 Runner 动态插件注册）
+func (e *DAGEngine) RegisterProcessor(p processor.ProcessorInterface) {
+	e.registry.Register(p)
+}
+
+// RegisterExecutor 兼容旧版适配器注册方法
 func (e *DAGEngine) RegisterExecutor(nodeType wfModel.NodeType, executor NodeExecutor) {
-	e.executors[nodeType] = executor
+	e.registry.Register(&legacyExecutorAdapter{nodeType: string(nodeType), executor: executor})
+}
+
+// legacyExecutorAdapter 旧版 NodeExecutor 兼容适配器
+type legacyExecutorAdapter struct {
+	processor.BaseProcessor
+	nodeType string
+	executor NodeExecutor
+}
+
+func (l *legacyExecutorAdapter) GetType() string {
+	return l.nodeType
+}
+
+func (l *legacyExecutorAdapter) Execute(ctx context.Context, execCtx *processor.ExecutionContext) (*processor.ExecutionResult, error) {
+	node := &wfModel.WorkflowNode{
+		ID:     execCtx.NodeID,
+		Name:   execCtx.NodeName,
+		Type:   wfModel.NodeType(execCtx.NodeType),
+		Config: execCtx.Config,
+	}
+	scope := NewContextScope(nil)
+	res, err := l.executor.Execute(ctx, node, scope)
+	if err != nil {
+		return nil, err
+	}
+	return &processor.ExecutionResult{
+		Status:     string(res.Status),
+		DurationMs: res.DurationMs,
+		Output:     res.Output,
+		Evidence:   res.Evidence,
+		Error:      res.Error,
+	}, nil
 }
 
 // ExecuteGraph 调度执行 DAG
@@ -149,15 +198,13 @@ func (e *DAGEngine) ExecuteGraph(ctx context.Context, graph *wfModel.WorkflowGra
 		node := nodeMap[nodeID]
 
 		nodeStart := time.Now()
-		executor, exists := e.executors[node.Type]
 		var res *wfModel.NodeExecutionResult
-		var err error
 
 		// 执行前进行全局变量池插值替换 (Interpolation)
 		resolvedConfig := InterpolateConfig(node.Config, scope)
-		execNode := *node
-		execNode.Config = resolvedConfig
 
+		// 从注册中心动态获取匹配的处理器插件 (对标 aegis-runner ProcessorRegistry.get_processor)
+		proc, exists := e.registry.Get(string(node.Type))
 		if !exists {
 			res = &wfModel.NodeExecutionResult{
 				NodeID:         node.ID,
@@ -165,21 +212,62 @@ func (e *DAGEngine) ExecuteGraph(ctx context.Context, graph *wfModel.WorkflowGra
 				Status:         wfModel.NodeStatusFailed,
 				DurationMs:     time.Since(nodeStart).Milliseconds(),
 				ResolvedConfig: resolvedConfig,
-				Error:          fmt.Sprintf("unsupported node type: %s", node.Type),
+				Error:          fmt.Sprintf("no processor plugin registered for type: %s", node.Type),
 			}
 		} else {
-			res, err = executor.Execute(ctx, &execNode, scope)
-			if err != nil && res == nil {
+			// 配置有效性静态校验 (对标 validate_config)
+			if valErr := proc.ValidateConfig(resolvedConfig); valErr != nil {
 				res = &wfModel.NodeExecutionResult{
 					NodeID:         node.ID,
 					NodeName:       node.Name,
 					Status:         wfModel.NodeStatusFailed,
 					DurationMs:     time.Since(nodeStart).Milliseconds(),
 					ResolvedConfig: resolvedConfig,
-					Error:          err.Error(),
+					Error:          valErr.Error(),
 				}
-			} else if res != nil {
-				res.ResolvedConfig = resolvedConfig
+			} else {
+				// 构建标准化执行上下文
+				execCtx := &processor.ExecutionContext{
+					NodeID:             node.ID,
+					NodeName:           node.Name,
+					NodeType:           string(node.Type),
+					Config:             resolvedConfig,
+					PredecessorResults: make(map[string]interface{}),
+					ScopeGetter:        scope.Get,
+					ScopeSetter:        scope.Set,
+				}
+				for _, depID := range node.DependsOn {
+					if depRes, ok := resultMap[depID]; ok {
+						execCtx.PredecessorResults[depID] = depRes.Output
+					}
+				}
+
+				procRes, err := proc.Execute(ctx, execCtx)
+				if err != nil && procRes == nil {
+					res = &wfModel.NodeExecutionResult{
+						NodeID:         node.ID,
+						NodeName:       node.Name,
+						Status:         wfModel.NodeStatusFailed,
+						DurationMs:     time.Since(nodeStart).Milliseconds(),
+						ResolvedConfig: resolvedConfig,
+						Error:          err.Error(),
+					}
+				} else if procRes != nil {
+					nodeStatus := wfModel.NodeStatusSuccess
+					if procRes.Status == "FAILED" {
+						nodeStatus = wfModel.NodeStatusFailed
+					}
+					res = &wfModel.NodeExecutionResult{
+						NodeID:         node.ID,
+						NodeName:       node.Name,
+						Status:         nodeStatus,
+						DurationMs:     procRes.DurationMs,
+						ResolvedConfig: resolvedConfig,
+						Output:         procRes.Output,
+						Evidence:       procRes.Evidence,
+						Error:          procRes.Error,
+					}
+				}
 			}
 		}
 
@@ -260,49 +348,5 @@ func (e *DAGEngine) ExecuteGraph(ctx context.Context, graph *wfModel.WorkflowGra
 		DurationMs:  time.Since(startTime).Milliseconds(),
 		NodeResults: resultMap,
 		Context:     scope.Snapshot(),
-	}, nil
-}
-
-// --- 默认内置执行器实现 ---
-
-type DefaultHTTPExecutor struct{}
-
-func (h *DefaultHTTPExecutor) Execute(ctx context.Context, node *wfModel.WorkflowNode, scope *ContextScope) (*wfModel.NodeExecutionResult, error) {
-	url, _ := node.Config["url"].(string)
-	scope.Set("last_http_call", url)
-	return &wfModel.NodeExecutionResult{
-		NodeID:     node.ID,
-		NodeName:   node.Name,
-		Status:     wfModel.NodeStatusSuccess,
-		DurationMs: 15,
-		Output:     map[string]interface{}{"status_code": 200, "url": url},
-		Evidence:   map[string]interface{}{"response": `{"code":200,"msg":"ok"}`},
-	}, nil
-}
-
-type DefaultSQLExecutor struct{}
-
-func (s *DefaultSQLExecutor) Execute(ctx context.Context, node *wfModel.WorkflowNode, scope *ContextScope) (*wfModel.NodeExecutionResult, error) {
-	sql, _ := node.Config["sql"].(string)
-	return &wfModel.NodeExecutionResult{
-		NodeID:     node.ID,
-		NodeName:   node.Name,
-		Status:     wfModel.NodeStatusSuccess,
-		DurationMs: 8,
-		Output:     map[string]interface{}{"affected_rows": 1},
-		Evidence:   map[string]interface{}{"sql": sql, "balance_verified": true},
-	}, nil
-}
-
-type DefaultQualityGateExecutor struct{}
-
-func (q *DefaultQualityGateExecutor) Execute(ctx context.Context, node *wfModel.WorkflowNode, scope *ContextScope) (*wfModel.NodeExecutionResult, error) {
-	return &wfModel.NodeExecutionResult{
-		NodeID:     node.ID,
-		NodeName:   node.Name,
-		Status:     wfModel.NodeStatusSuccess,
-		DurationMs: 2,
-		Output:     map[string]interface{}{"gate_passed": true},
-		Evidence:   map[string]interface{}{"p0_uncovered_count": 0, "decision": "RELEASE_APPROVED"},
 	}, nil
 }
