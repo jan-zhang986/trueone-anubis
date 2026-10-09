@@ -21,7 +21,7 @@ import (
 	"trueone-anubis/internal/model"
 	"trueone-anubis/internal/response"
 	"trueone-anubis/internal/service"
-	"trueone-anubis/internal/workflow/parser"
+	"github.com/vanguard-platform/aegis-sdk-go/workflow/parser"
 )
 
 type RepoCaseHandler struct {

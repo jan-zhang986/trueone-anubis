@@ -5,22 +5,17 @@ import (
 	"fmt"
 	"time"
 
-	"trueone-anubis/internal/workflow/engine"
-	wfModel "trueone-anubis/internal/workflow/model"
-	"trueone-anubis/internal/workflow/parser"
+	"github.com/vanguard-platform/aegis-sdk-go/workflow"
+	wfModel "github.com/vanguard-platform/aegis-sdk-go/workflow/model"
 )
 
-type WorkflowService struct {
-	dagEngine *engine.DAGEngine
-}
+type WorkflowService struct{}
 
 func NewWorkflowService() *WorkflowService {
-	return &WorkflowService{
-		dagEngine: engine.NewDAGEngine(),
-	}
+	return &WorkflowService{}
 }
 
-// ExecuteGraph 接收并执行工作流 DAG
+// ExecuteGraph 接收并执行工作流 DAG（委托给共享的 trueone-sdk 内核）
 func (s *WorkflowService) ExecuteGraph(graph *wfModel.WorkflowGraph, params map[string]interface{}) (*wfModel.WorkflowExecutionResult, error) {
 	if graph == nil || len(graph.Nodes) == 0 {
 		return nil, fmt.Errorf("workflow graph nodes cannot be empty")
@@ -29,26 +24,13 @@ func (s *WorkflowService) ExecuteGraph(graph *wfModel.WorkflowGraph, params map[
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	combinedParams := make(map[string]interface{})
-	if graph.Params != nil {
-		for k, v := range graph.Params {
-			combinedParams[k] = v
-		}
-	}
-	if params != nil {
-		for k, v := range params {
-			combinedParams[k] = v
-		}
-	}
-
-	return s.dagEngine.ExecuteGraph(ctx, graph, combinedParams)
+	return workflow.RunGraph(ctx, graph, params)
 }
 
-// ExecuteYAML 解析 YAML 并调度执行 DAG
+// ExecuteYAML 解析 YAML 并调度执行 DAG（委托给共享的 trueone-sdk 内核）
 func (s *WorkflowService) ExecuteYAML(yamlContent string, params map[string]interface{}) (*wfModel.WorkflowExecutionResult, error) {
-	graph, err := parser.ParseWorkflowYAML([]byte(yamlContent))
-	if err != nil {
-		return nil, fmt.Errorf("解析 YAML 工作流错误: %w", err)
-	}
-	return s.ExecuteGraph(graph, params)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	return workflow.RunYAML(ctx, []byte(yamlContent), params)
 }

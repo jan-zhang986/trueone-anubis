@@ -4,9 +4,9 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	wfModel "github.com/vanguard-platform/aegis-sdk-go/workflow/model"
 	"trueone-anubis/internal/response"
 	"trueone-anubis/internal/service"
-	wfModel "trueone-anubis/internal/workflow/model"
 )
 
 type WorkflowHandler struct {
