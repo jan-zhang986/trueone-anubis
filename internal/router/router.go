@@ -67,6 +67,7 @@ func SetupRouter() *gin.Engine {
 		rg.POST("/case/repository/:id/branches", repoCaseH.CreateRepositoryBranch)
 		rg.POST("/case/repository/:id/sync", repoCaseH.SyncRepository)
 		rg.POST("/case/repository/:id/execute-case", repoCaseH.ExecuteCase)
+		rg.POST("/case/repository/:id/commit", repoCaseH.CommitCode)
 
 		// Environment
 		rg.POST("/project/environment/list", projH.GetEnvironmentList)

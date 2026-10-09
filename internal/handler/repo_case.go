@@ -1176,3 +1176,126 @@ func (h *RepoCaseHandler) ExecuteCase(c *gin.Context) {
 	})
 }
 
+type CommitCodeRequest struct {
+	Branch        string `json:"branch"`
+	FilePath      string `json:"filePath" binding:"required"`
+	CodeContent   string `json:"codeContent" binding:"required"`
+	CommitMessage string `json:"commitMessage"`
+	Author        string `json:"author"`
+}
+
+// CommitCode 在线修改测试代码并提交/推送到 Git 远端 (GitHub)
+func (h *RepoCaseHandler) CommitCode(c *gin.Context) {
+	id := c.Param("id")
+	var req CommitCodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, 400, "参数错误: "+err.Error())
+		return
+	}
+
+	var repo model.CaseRepository
+	if err := config.DB.Where("id = ?", id).First(&repo).Error; err != nil {
+		response.Fail(c, 404, "用例库不存在")
+		return
+	}
+
+	branch := req.Branch
+	if branch == "" {
+		branch = repo.DefaultBranch
+		if branch == "" {
+			branch = "main"
+		}
+	}
+
+	commitMsg := req.CommitMessage
+	if commitMsg == "" {
+		commitMsg = fmt.Sprintf("test: update %s via TrueOne Online Editor", filepath.Base(req.FilePath))
+	}
+
+	localBase := repo.LocalPath
+	if localBase == "" {
+		for _, probe := range []string{
+			"/Users/zhangjian/vanguard-platform/trueone-anubis",
+			".",
+		} {
+			if fi, err := os.Stat(probe); err == nil && fi.IsDir() {
+				localBase = probe
+				break
+			}
+		}
+	}
+
+	if localBase == "" {
+		response.Fail(c, 500, "未找到本地 Git 工作区，无法执行本地提交推送")
+		return
+	}
+
+	// 1. 将修改后的代码写入目标文件
+	fullPath := filepath.Join(localBase, req.FilePath)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		response.Fail(c, 500, "创建目录失败: "+err.Error())
+		return
+	}
+	if err := os.WriteFile(fullPath, []byte(req.CodeContent), 0644); err != nil {
+		response.Fail(c, 500, "写入文件失败: "+err.Error())
+		return
+	}
+
+	// 2. 执行 git add
+	if out, err := exec.Command("git", "-C", localBase, "add", req.FilePath).CombinedOutput(); err != nil {
+		response.Fail(c, 500, fmt.Sprintf("git add 失败: %s (%v)", string(out), err))
+		return
+	}
+
+	// 检查是否有 staged 变动
+	diffCmd := exec.Command("git", "-C", localBase, "diff", "--cached", "--quiet")
+	if diffCmd.Run() == nil {
+		// 没有实质改动（内容一致）
+		response.Success(c, gin.H{
+			"message": "文件内容未发生变动，无需提交",
+			"status":  "NO_CHANGE",
+		})
+		return
+	}
+
+	// 3. 执行 git commit
+	author := req.Author
+	if author == "" {
+		author = "TrueOne Web Architect <qa@trueone.io>"
+	} else if !strings.Contains(author, "<") {
+		author = fmt.Sprintf("%s <qa@trueone.io>", author)
+	}
+
+	commitCmd := exec.Command("git", "-C", localBase, "commit", "-m", commitMsg, "--author", author)
+	if out, err := commitCmd.CombinedOutput(); err != nil {
+		response.Fail(c, 500, fmt.Sprintf("git commit 失败: %s (%v)", string(out), err))
+		return
+	}
+
+	// 获取最新 commit sha
+	shaOut, _ := exec.Command("git", "-C", localBase, "rev-parse", "HEAD").Output()
+	commitSha := strings.TrimSpace(string(shaOut))
+
+	// 4. 执行 git push 提交到 GitHub 远端
+	pushCmd := exec.Command("git", "-C", localBase, "push", "origin", branch)
+	pushOut, err := pushCmd.CombinedOutput()
+	if err != nil {
+		// 提交到本地成功，但推送到远端遇到告警或网络问题
+		response.Success(c, gin.H{
+			"commitSha":  commitSha,
+			"pushed":     false,
+			"warning":    fmt.Sprintf("Git Commit 已成功生成 (%s)，但推送远端失败: %s", commitSha[:7], string(pushOut)),
+			"message":    "代码已本地提交",
+		})
+		return
+	}
+
+	response.Success(c, gin.H{
+		"commitSha": commitSha,
+		"pushed":    true,
+		"branch":    branch,
+		"message":   fmt.Sprintf("成功提交并推送到 GitHub %s 分支 (commit: %s)", branch, commitSha[:7]),
+	})
+}
+
+
