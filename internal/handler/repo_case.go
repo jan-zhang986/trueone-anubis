@@ -144,6 +144,64 @@ func parseGitHubRepoURL(rawURL string) (owner string, repo string) {
 	return "", ""
 }
 
+// 智能推断测试步骤的预期断言与校验要求，杜绝千篇一律的通用模板
+func inferStepExpected(stepName string) string {
+	clean := regexp.MustCompile(`^\d+[\.、\s]+`).ReplaceAllString(strings.TrimSpace(stepName), "")
+	s := strings.ToLower(clean)
+
+	switch {
+	case strings.Contains(s, "非法密码") || strings.Contains(s, "错误密码") || strings.Contains(s, "捕获拦截"):
+		return "安全防护拦截生效，拒绝非法登录并返回明确业务拦截码 (如 400)"
+	case strings.Contains(s, "未颁发") || strings.Contains(s, "防泄露") || strings.Contains(s, "未泄露"):
+		return "敏感凭证防泄露校验通过，未下发任何有效会话令牌及 Token"
+	case strings.Contains(s, "防重放") || strings.Contains(s, "会话与防重放") || strings.Contains(s, "csrftoken"):
+		return "成功下发有效 session_id 与 csrf_token 防重放签名凭据"
+	case strings.Contains(s, "404") || strings.Contains(s, "不存在"):
+		return "目标资源检索失败，正确响应 HTTP 404 Not Found"
+	case strings.Contains(s, "signout") || strings.Contains(s, "登出") || strings.Contains(s, "退出"):
+		return "会话服务端作废成功，再次调用受限接口将被鉴权拦截"
+	case strings.Contains(s, "is-login") || strings.Contains(s, "登录态"):
+		return "会话鉴权通过，接口响应 HTTP 200 且返回用户基础上下文"
+	case strings.Contains(s, "post /login") || strings.Contains(s, "登录接口调用"):
+		return "登录接口响应 HTTP 200，颁发有效用户会话与凭证"
+	case strings.Contains(s, "构造") || strings.Contains(s, "载荷") || strings.Contains(s, "初始化"):
+		return "测试前置数据及输入参数准备完成，符合 Schema 规范"
+	case strings.Contains(s, "post /projects") || strings.Contains(s, "新建项目"):
+		return "项目创建成功并落库，生成有效项目 ID"
+	case strings.Contains(s, "get /projects/:id") || strings.Contains(s, "检索详情"):
+		return "项目详情检索成功，字段结构与创建基线完全对齐"
+	case strings.Contains(s, "delete /projects") || strings.Contains(s, "执行删除"):
+		return "项目删除接口响应 200，实体逻辑/物理删除生效"
+	case strings.Contains(s, "organization/add") || strings.Contains(s, "新建组织"):
+		return "新组织创建成功并落库，生成全局唯一租户 ID"
+	case strings.Contains(s, "organization/rename") || strings.Contains(s, "重命名组织"):
+		return "重命名操作提交成功，数据库组织名称更新生效"
+	case strings.Contains(s, "organization/list") || strings.Contains(s, "查询列表"):
+		return "组织列表正常返回，能够检索到当前预期记录"
+	case strings.Contains(s, "租户隔离") || strings.Contains(s, "所属组织归属"):
+		return "租户多维数据隔离校验通过，无越权越界数据泄漏"
+	case strings.Contains(s, "trade_ledger") || strings.Contains(s, "借贷平衡") || strings.Contains(s, "balance"):
+		return "核心账户 balance 扣减准确，借贷双边平衡对账无差错"
+	case strings.Contains(s, "quality_gate") || strings.Contains(s, "门禁") || strings.Contains(s, "zero_capital"):
+		return "全链路资金零差错安全门禁通过，准出指标满足阈值要求"
+	case strings.Contains(s, "秒杀下单") || strings.Contains(s, "order/create"):
+		return "网关下单接口响应 HTTP 200，成功生成有效订单号"
+	case strings.Contains(s, "断言") || strings.Contains(s, "校验") || strings.Contains(s, "验证"):
+		if strings.Contains(s, "对齐") || strings.Contains(s, "一致") {
+			return "核心业务字段逐项比对完全对齐，预期值与实际值一致"
+		}
+		return fmt.Sprintf("%s成功，业务约束与断言条件完全满足", clean)
+	case strings.Contains(s, "post") || strings.Contains(s, "新建") || strings.Contains(s, "创建"):
+		return "接口响应成功，实体创建成功并落库"
+	case strings.Contains(s, "get") || strings.Contains(s, "查询") || strings.Contains(s, "读取"):
+		return "接口成功响应 HTTP 200，返回目标数据集无异常"
+	case strings.Contains(s, "delete") || strings.Contains(s, "删除"):
+		return "资源已被成功删除，后续访问返回 404"
+	default:
+		return fmt.Sprintf("执行完成，%s无异常抛出", clean)
+	}
+}
+
 // 从代码文本中解析用例与步骤
 func parseGoTestContent(content, relPath, gitRepoURL, branch string, isCloud bool) []UnifiedTestCaseItem {
 	var result []UnifiedTestCaseItem
@@ -192,7 +250,7 @@ func parseGoTestContent(content, relPath, gitRepoURL, branch string, isCloud boo
 			steps = append(steps, TestCaseStepItem{
 				StepNumber: idx + 1,
 				Name:       sm[1],
-				Expected:   "断言校验通过并留痕",
+				Expected:   inferStepExpected(sm[1]),
 				Status:     "passed",
 				DurationMs: 8,
 			})
@@ -261,7 +319,7 @@ func parseWorkflowYamlContent(content string, relPath string, gitRepoURL string,
 		steps = append(steps, TestCaseStepItem{
 			StepNumber: idx + 1,
 			Name:       fmt.Sprintf("[%s] %s%s", node.Type, node.Name, depStr),
-			Expected:   "节点拓扑调度通过并产出执行快照与上下文",
+			Expected:   inferStepExpected(fmt.Sprintf("[%s] %s", node.Type, node.Name)),
 			Status:     "passed",
 			DurationMs: 15,
 		})
