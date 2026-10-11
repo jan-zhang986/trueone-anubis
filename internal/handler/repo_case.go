@@ -1723,5 +1723,117 @@ nodes:
 	})
 }
 
+type GitCommitItem struct {
+	Hash       string `json:"hash"`
+	ShortHash  string `json:"shortHash"`
+	Author     string `json:"author"`
+	Date       string `json:"date"`
+	Message    string `json:"message"`
+	Diff       string `json:"diff"`
+	LinesAdded int    `json:"linesAdded"`
+	LinesDel   int    `json:"linesDel"`
+}
 
+type FileGitHistoryResult struct {
+	FilePath              string          `json:"filePath"`
+	UncommittedDiff       string          `json:"uncommittedDiff"`
+	HasWorkingTreeChanges bool            `json:"hasWorkingTreeChanges"`
+	Commits               []GitCommitItem `json:"commits"`
+}
 
+// GetFileGitHistory 获取指定用例文件的 Git 变更日志与 Diff 历史
+func (h *RepoCaseHandler) GetFileGitHistory(c *gin.Context) {
+	repoID := c.Param("id")
+	filePath := c.Query("filePath")
+	branch := c.DefaultQuery("branch", "main")
+
+	if filePath == "" {
+		response.Fail(c, 400, "缺少 filePath 参数")
+		return
+	}
+
+	var repo model.CaseRepository
+	if err := config.DB.Where("id = ?", repoID).First(&repo).Error; err != nil {
+		response.Fail(c, 404, "仓库不存在")
+		return
+	}
+
+	localBase := repo.LocalPath
+	if localBase == "" {
+		for _, probe := range []string{
+			"/Users/zhangjian/vanguard-platform/trueone-anubis",
+			".",
+		} {
+			if fi, err := os.Stat(probe); err == nil && fi.IsDir() {
+				localBase = probe
+				break
+			}
+		}
+	}
+
+	result := FileGitHistoryResult{
+		FilePath: filePath,
+		Commits:  []GitCommitItem{},
+	}
+
+	if localBase != "" {
+		// 1. 获取工作区未提交改动 (git diff HEAD -- filePath)
+		uncommittedOut, err := exec.Command("git", "-C", localBase, "diff", "HEAD", "--", filePath).CombinedOutput()
+		if err == nil && len(bytes.TrimSpace(uncommittedOut)) > 0 {
+			result.UncommittedDiff = string(uncommittedOut)
+			result.HasWorkingTreeChanges = true
+		}
+
+		// 2. 获取该文件的 Commit 历史 (最多 20 条)
+		logCmd := exec.Command("git", "-C", localBase, "log", "-n", "20", "--pretty=format:%H%x09%h%x09%an%x09%ad%x09%s", "--date=iso", branch, "--", filePath)
+		logOut, err := logCmd.CombinedOutput()
+		if err != nil || len(bytes.TrimSpace(logOut)) == 0 {
+			logCmd = exec.Command("git", "-C", localBase, "log", "-n", "20", "--pretty=format:%H%x09%h%x09%an%x09%ad%x09%s", "--date=iso", "--", filePath)
+			logOut, _ = logCmd.CombinedOutput()
+		}
+
+		lines := strings.Split(string(logOut), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			parts := strings.Split(line, "\t")
+			if len(parts) < 5 {
+				continue
+			}
+			hash := parts[0]
+			shortHash := parts[1]
+			author := parts[2]
+			date := parts[3]
+			msg := parts[4]
+
+			diffCmd := exec.Command("git", "-C", localBase, "show", "--pretty=format:", "--unified=3", hash, "--", filePath)
+			diffOut, _ := diffCmd.CombinedOutput()
+			diffStr := string(diffOut)
+
+			added := 0
+			del := 0
+			for _, dLine := range strings.Split(diffStr, "\n") {
+				if strings.HasPrefix(dLine, "+") && !strings.HasPrefix(dLine, "+++") {
+					added++
+				} else if strings.HasPrefix(dLine, "-") && !strings.HasPrefix(dLine, "---") {
+					del++
+				}
+			}
+
+			result.Commits = append(result.Commits, GitCommitItem{
+				Hash:       hash,
+				ShortHash:  shortHash,
+				Author:     author,
+				Date:       date,
+				Message:    msg,
+				Diff:       diffStr,
+				LinesAdded: added,
+				LinesDel:   del,
+			})
+		}
+	}
+
+	response.Success(c, result)
+}
